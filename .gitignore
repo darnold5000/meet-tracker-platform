@@ -1,0 +1,27 @@
+# Keep this repo focused on meet-tracker stack
+projects/
+docs/
+cursor/
+.cursor/
+venv*/
+.venv/
+# Node / Next
+node_modules/
+.next/
+out/
+dist/
+coverage/
+*.log
+# Env
+.env
+.env.*
+!.env.example
+!.env.local.example
+# Python
+__pycache__/
+*.pyc
+# Flutter/Dart
+.dart_tool/
+build/
+# macOS
+.DS_Store

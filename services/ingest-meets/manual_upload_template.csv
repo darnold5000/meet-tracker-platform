@@ -1,0 +1,4 @@
+meet_id,athlete_name,gym,level,division,aa_score,aa_place,vault,vault_place,bars,bars_place,beam,beam_place,floor,floor_place
+MSO-35397,Jane Smith,The Flip Zone,6,Sr 1,38.625,1,9.550,2,9.750,1,9.600,1,9.725,1
+MSO-35397,Mary Johnson,The Flip Zone,6,Sr 1,37.900,2,9.400,3,9.500,2,9.200,3,8.800,2
+MSO-35397,Example Athlete,Integrity Athletics,7,Jr 3,36.500,5,9.000,,9.200,,9.100,,9.200,
