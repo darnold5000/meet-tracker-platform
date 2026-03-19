@@ -155,8 +155,8 @@ def _discover_from_mso_page(url: str, state: str = None) -> List[Dict]:
         if not name or len(name) < 4:
             name = _slug_to_name(slug)
 
-        # Parse dates and location from nearby text
-        date_str, location = _extract_date_location(link)
+        # Parse dates, location, facility, and host gym from nearby text
+        start_date, end_date, location, facility, host_gym = _extract_meet_metadata(link)
 
         meets.append({
             "meet_id": meet_id,
@@ -164,8 +164,11 @@ def _discover_from_mso_page(url: str, state: str = None) -> List[Dict]:
             "mso_url": full_url,
             "source": "mso",
             "state": slug_state,
-            "start_date": date_str,
+            "start_date": start_date,
+            "end_date": end_date,
             "location": location,
+            "facility": facility,
+            "host_gym": host_gym,
             "discovered_at": datetime.utcnow().isoformat(),
         })
 
@@ -207,8 +210,8 @@ def _discover_from_mso_search(url: str, state: str = None) -> List[Dict]:
         full_url = href if href.startswith("http") else f"{MSO_BASE_URL}{href}"
         name = _extract_meet_name(link)
         
-        # Try to extract date and location from nearby text
-        date_str, location = _extract_date_location(link)
+        # Try to extract date range, location, facility, and host gym from nearby text
+        start_date, end_date, location, facility, host_gym = _extract_meet_metadata(link)
 
         meets.append({
             "meet_id": f"MSO-{numeric_id}",
@@ -216,8 +219,11 @@ def _discover_from_mso_search(url: str, state: str = None) -> List[Dict]:
             "mso_url": full_url,
             "source": "mso",
             "state": state,
-            "start_date": date_str,
+            "start_date": start_date,
+            "end_date": end_date,
             "location": location,
+            "facility": facility,
+            "host_gym": host_gym,
             "discovered_at": datetime.utcnow().isoformat(),
         })
 
@@ -231,7 +237,7 @@ def _discover_from_mso_search(url: str, state: str = None) -> List[Dict]:
 
         full_url = href if href.startswith("http") else f"{MSO_BASE_URL}{href}"
         name = _extract_meet_name(link)
-        date_str, location = _extract_date_location(link)
+        start_date, end_date, location, facility, host_gym = _extract_meet_metadata(link)
 
         meets.append({
             "meet_id": f"MSO-{numeric_id}",
@@ -239,8 +245,11 @@ def _discover_from_mso_search(url: str, state: str = None) -> List[Dict]:
             "mso_url": full_url,
             "source": "mso",
             "state": state,
-            "start_date": date_str,
+            "start_date": start_date,
+            "end_date": end_date,
             "location": location,
+            "facility": facility,
+            "host_gym": host_gym,
             "discovered_at": datetime.utcnow().isoformat(),
         })
 
@@ -292,13 +301,16 @@ def _slug_to_name(slug: str) -> str:
     return " ".join(name_parts)
 
 
-def _extract_date_location(link) -> tuple:
+def _extract_meet_metadata(link) -> tuple:
     """
-    Walk siblings/parents near a meet link to find a date string and location.
-    Returns (date_str_or_None, location_or_None).
+    Walk siblings/parents near a meet link to find start/end date, location, facility, and host gym.
+    Returns (start_date_or_None, end_date_or_None, location_or_None, facility_or_None, host_gym_or_None).
     """
-    date_str = None
+    start_date = None
+    end_date = None
     location = None
+    facility = None
+    host_gym = None
 
     parent = link.parent
     for _ in range(5):
@@ -306,15 +318,26 @@ def _extract_date_location(link) -> tuple:
             break
         text = parent.get_text(separator=" ", strip=True)
 
-        # Try date pattern: "Jan 09, 2026" or "Jan 09, 2026 - Jan 11, 2026"
-        date_match = re.search(
+        # Parse first/second long-date matches as start/end (if present)
+        date_matches = re.findall(
             r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}",
-            text
+            text,
         )
-        if date_match and date_str is None:
+        if date_matches and start_date is None:
+            # re.findall above only returns month names due to groups; use finditer for full match text
+            full_matches = list(
+                re.finditer(
+                    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+\d{4}",
+                    text,
+                )
+            )
             try:
-                date_str = datetime.strptime(date_match.group(), "%b %d, %Y").date().isoformat()
-            except ValueError:
+                start_date = datetime.strptime(full_matches[0].group(), "%b %d, %Y").date().isoformat()
+                if len(full_matches) > 1:
+                    end_date = datetime.strptime(full_matches[1].group(), "%b %d, %Y").date().isoformat()
+                else:
+                    end_date = start_date
+            except (ValueError, IndexError):
                 pass
 
         # Try location: "City, ST" pattern
@@ -322,17 +345,37 @@ def _extract_date_location(link) -> tuple:
         if loc_match and location is None:
             location = loc_match.group(1).strip()
 
-        if date_str and location:
+        if facility is None:
+            facility_match = re.search(
+                r"(?:Facility|Venue|Location)\s*[:\-]\s*([A-Za-z0-9&'().,\-\/\s]{3,120})",
+                text,
+                re.IGNORECASE,
+            )
+            if facility_match:
+                facility = facility_match.group(1).strip(" .,-")
+
+        # Try host gym patterns often used on listings
+        if host_gym is None:
+            host_match = re.search(
+                r"(?:Hosted by|Host(?:ed)?\s*Gym|Host)\s*[:\-]\s*([A-Za-z0-9&'().,\-\/\s]{3,80})",
+                text,
+                re.IGNORECASE,
+            )
+            if host_match:
+                host_gym = host_match.group(1).strip(" .,-")
+
+        if start_date and location and facility and host_gym:
             break
         parent = parent.parent
 
-    return date_str, location
+    return start_date, end_date, location, facility, host_gym
 
 
 def build_meet_dict(
     meet_id: str,
     name: str,
     location: Optional[str] = None,
+    facility: Optional[str] = None,
     state: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
@@ -346,6 +389,7 @@ def build_meet_dict(
         "meet_id": meet_id,
         "name": name,
         "location": location,
+        "facility": facility,
         "state": state,
         "start_date": start_date.isoformat() if start_date else None,
         "end_date": end_date.isoformat() if end_date else None,

@@ -61,6 +61,7 @@ def _meet_to_dict(m: Meet) -> dict:
         "meet_id": m.meet_id,
         "name": m.name,
         "location": m.location,
+        "facility": m.facility,
         "state": m.state,
         "start_date": m.start_date.isoformat() if m.start_date else None,
         "end_date": m.end_date.isoformat() if m.end_date else None,

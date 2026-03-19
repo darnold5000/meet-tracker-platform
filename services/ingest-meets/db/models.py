@@ -63,6 +63,7 @@ class Meet(Base):
     meet_id = Column(String(100), unique=True, nullable=False)  # e.g. "2026-IN-STATE"
     name = Column(String(255), nullable=False)
     location = Column(String(255))
+    facility = Column(String(255))
     state = Column(String(2))
     start_date = Column(Date)
     end_date = Column(Date)

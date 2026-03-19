@@ -28,7 +28,9 @@ from agents.mso_scraper import scrape_mso_meet, audit_duplicate_hashes, deduplic
 import logging
 import os
 import sys
+import re
 from datetime import datetime
+from typing import Optional
 from sqlalchemy.exc import IntegrityError
 
 
@@ -96,7 +98,7 @@ from agents.meet_discovery import discover_meets
 from core.normalizer import normalize_mso_record, normalize_mso_api_record
 from core.gym_normalizer import normalize_gym_name as normalize_gym_name_canonical
 from db.database import SessionLocal, create_tables, engine
-from db.models import Meet, Athlete, AthleteAlias, Score, Gym, IngestSourceState
+from db.models import Meet, Athlete, AthleteAlias, Score, Gym, IngestSourceState, Session
 import hashlib
 
 # ---------------------------------------------------------------------------
@@ -210,12 +212,12 @@ TARGET_MEETS = [
     #     "start_date": "2026-03-13", "location": "Crown Pointe, IN",
     # }
     # {
-    #     "meet_id": "MSO-36489",
-    #     "name": "2026 I AM Classic Meet",
-    #     "mso_url": "https://www.meetscoresonline.com/R36489",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-03-13", "location": "Plymouth, IN",
-    # },
+        "meet_id": "MSO-36489",
+        "name": "2026 I AM Classic Meet",
+        "mso_url": "https://www.meetscoresonline.com/R36489",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-03-13", "location": "Plymouth, IN",
+    },
     # {
     #     "meet_id": "MSO-36105",
     #     "name": "Money Madness 2026 - NGA",
@@ -303,6 +305,8 @@ def save_meets(meets: list) -> tuple:
                 existing.start_date = _parse_date(m.get("start_date")) or existing.start_date
                 existing.end_date = _parse_date(m.get("end_date")) or existing.end_date
                 existing.location = m.get("location") or existing.location
+                existing.facility = m.get("facility") or existing.facility
+                existing.host_gym = m.get("host_gym") or existing.host_gym
                 existing.state = m.get("state") or existing.state
                 existing.mso_url = m.get("mso_url") or existing.mso_url
                 skipped += 1
@@ -313,8 +317,10 @@ def save_meets(meets: list) -> tuple:
                 name=m.get("name", "Unknown Meet"),
                 state=m.get("state"),
                 location=m.get("location"),
+                facility=m.get("facility"),
                 start_date=_parse_date(m.get("start_date")),
                 end_date=_parse_date(m.get("end_date")),
+                host_gym=m.get("host_gym"),
                 mso_url=m.get("mso_url"),
                 scorecat_url=m.get("scorecat_url"),
                 website_url=m.get("website_url"),
@@ -542,6 +548,86 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
     inserted = 0
     skipped = 0
 
+    session_cache: dict[tuple[Optional[int], Optional[datetime]], Optional[Session]] = {}
+
+    def _parse_session_metadata(raw: str) -> tuple[Optional[int], Optional[datetime]]:
+        """
+        Best-effort mapping from scraper session label -> (session_number, start_time).
+        This is intentionally tolerant because MSO session labels vary across meets.
+        """
+        if not raw:
+            return None, None
+
+        s = str(raw).strip()
+
+        # 1) Session number like "Session 01" or "Session 1"
+        m = re.search(r"Session\s*0*(\d+)", s, flags=re.IGNORECASE)
+        session_number: Optional[int] = int(m.group(1)) if m else None
+
+        # 2) Date like M/D/YYYY (also found in "Saturday 3/14/2026")
+        date_match = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
+        start_time: Optional[datetime] = None
+        if date_match:
+            mm, dd, yyyy = (int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
+            # 24h time parsing if present, otherwise midnight
+            time_match = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)", s, flags=re.IGNORECASE)
+            if time_match:
+                hh = int(time_match.group(1))
+                minutes = int(time_match.group(2))
+                ampm = time_match.group(3).upper()
+                if ampm == "PM" and hh != 12:
+                    hh += 12
+                if ampm == "AM" and hh == 12:
+                    hh = 0
+                start_time = datetime(yyyy, mm, dd, hh, minutes)
+            else:
+                start_time = datetime(yyyy, mm, dd, 0, 0)
+
+        # 3) Many MSO session picker labels look like "01A", "02B", etc.
+        # Extract the leading digits even if the next char is a letter (no word boundary).
+        if session_number is None:
+            m2 = re.match(r"^\s*0*(\d+)", s)
+            if m2:
+                session_number = int(m2.group(1))
+
+        return session_number, start_time
+
+    def _get_or_create_session(
+        db,
+        *,
+        meet_db_id: int,
+        session_key: str,
+        session_number: Optional[int],
+        start_time: Optional[datetime],
+    ) -> Optional[Session]:
+        # If the scraper didn't give us anything useful, keep the FK null.
+        if not session_key:
+            return None
+
+        cache_key = (session_number, start_time)
+        if cache_key in session_cache:
+            return session_cache[cache_key]
+
+        q = db.query(Session).filter(Session.meet_id == meet_db_id)
+        if session_number is None:
+            q = q.filter(Session.session_number.is_(None))
+        else:
+            q = q.filter(Session.session_number == session_number)
+
+        if start_time is None:
+            q = q.filter(Session.start_time.is_(None))
+        else:
+            q = q.filter(Session.start_time == start_time)
+
+        sess = q.first()
+        if not sess:
+            sess = Session(meet_id=meet_db_id, session_number=session_number, start_time=start_time)
+            db.add(sess)
+            db.flush()
+
+        session_cache[cache_key] = sess
+        return sess
+
     # Individual event columns in the normalized row → event label
     EVENT_FIELDS = {
         "vault":  "VT",
@@ -574,6 +660,8 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
             gym_name = row.get("gym", "").strip()
             level = row.get("level")
             division = row.get("division")
+            session_key = str(row.get("session") or "").strip()
+            session_number, session_start_time = _parse_session_metadata(session_key)
 
             events_to_save = []
 
@@ -602,7 +690,12 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
             # Precompute record_hashes without touching the DB.
             hashes = []
             for event_label, score_val, _place in events_to_save:
-                hash_input = f"{meet.id}|{athlete_name}|{event_label}|{score_val}"
+                # Include session in the hash only when we actually have a session label.
+                # This prevents different session-days from collapsing into the same row.
+                if session_key:
+                    hash_input = f"{meet.id}|{athlete_name}|{event_label}|{score_val}|{session_key}"
+                else:
+                    hash_input = f"{meet.id}|{athlete_name}|{event_label}|{score_val}"
                 h = hashlib.sha256(hash_input.encode()).hexdigest()
                 hashes.append(h)
                 all_hashes.append(h)
@@ -614,6 +707,9 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
                     "level": level,
                     "division": division,
                     "source": row.get("source", "mso"),
+                    "session_key": session_key,
+                    "session_number": session_number,
+                    "session_start_time": session_start_time,
                     "events": events_to_save,
                     "hashes": hashes,
                 }
@@ -651,6 +747,14 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
                 skipped += len(plan["events"])
                 continue
 
+            session_obj = _get_or_create_session(
+                db,
+                meet_db_id=meet.id,
+                session_key=plan.get("session_key") or "",
+                session_number=plan.get("session_number"),
+                start_time=plan.get("session_start_time"),
+            )
+
             for (event_label, score_val, place), record_hash in zip(plan["events"], plan["hashes"]):
                 if record_hash in seen_hashes_in_batch or record_hash in existing_hashes:
                     skipped += 1
@@ -660,6 +764,7 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
                 score = Score(
                     athlete_id=athlete.id,
                     meet_id=meet.id,
+                    session_id=session_obj.id if session_obj else None,
                     event=event_label,
                     score=score_val,
                     place=place,
