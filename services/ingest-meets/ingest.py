@@ -124,13 +124,13 @@ TARGET_MEETS = [
     #     "source": "mso", "state": "CA",
     #     "start_date": "2026-01-09", "location": "Anaheim, CA",
     # },
-    # {
-    #     "meet_id": "MSO-35799",
-    #     "name": "2026 Jaycie Phelps Midwest Showdown",
-    #     "mso_url": "https://www.meetscoresonline.com/R35799",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-01-23", "location": "French Lick, IN",
-    # },
+    {
+        "meet_id": "MSO-35799",
+        "name": "2026 Jaycie Phelps Midwest Showdown",
+        "mso_url": "https://www.meetscoresonline.com/R35799",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-01-23", "location": "French Lick, IN",
+    },
     # {
     #     "meet_id": "MSO-35846",
     #     "name": "2026 Jaycie Phelps Midwest Showdown NGA",
@@ -211,13 +211,13 @@ TARGET_MEETS = [
     #     "source": "mso", "state": "IN",
     #     "start_date": "2026-03-13", "location": "Crown Pointe, IN",
     # }
-    {
-        "meet_id": "MSO-36489",
-        "name": "2026 I AM Classic Meet",
-        "mso_url": "https://www.meetscoresonline.com/R36489",
-        "source": "mso", "state": "IN",
-        "start_date": "2026-03-13", "location": "Plymouth, IN",
-    },
+    # {
+    #     "meet_id": "MSO-36489",
+    #     "name": "2026 I AM Classic Meet",
+    #     "mso_url": "https://www.meetscoresonline.com/R36489",
+    #     "source": "mso", "state": "IN",
+    #     "start_date": "2026-03-13", "location": "Plymouth, IN",
+    # },
     # {
     #     "meet_id": "MSO-36105",
     #     "name": "Money Madness 2026 - NGA",
@@ -841,6 +841,33 @@ def format_sources(sources: dict) -> str:
     return source_str
 
 
+def _merge_missing_meet_metadata(base_meets: list[dict], discovered_meets: list[dict]) -> list[dict]:
+    """
+    Fill missing metadata on base meets using discovered meets.
+    Match by meet_id first, then by normalized mso_url.
+    """
+    by_id = {m.get("meet_id"): m for m in discovered_meets if m.get("meet_id")}
+    by_url = {
+        str(m.get("mso_url", "")).strip().lower(): m
+        for m in discovered_meets
+        if m.get("mso_url")
+    }
+    fields = ["start_date", "end_date", "location", "facility", "host_gym", "state"]
+
+    merged: list[dict] = []
+    for m in base_meets:
+        out = dict(m)
+        src = by_id.get(out.get("meet_id"))
+        if not src and out.get("mso_url"):
+            src = by_url.get(str(out.get("mso_url")).strip().lower())
+        if src:
+            for f in fields:
+                if not out.get(f) and src.get(f):
+                    out[f] = src.get(f)
+        merged.append(out)
+    return merged
+
+
 def interactive_meet_selection(meets: list) -> list:
     """Show interactive menu to select meets to scrape."""
     if not meets:
@@ -960,6 +987,18 @@ def _run_ingest_core(args) -> tuple[int, int]:
             print(f"  Mode: Using hardcoded TARGET_MEETS array")
             meets_to_process = TARGET_MEETS
             print(f"  Meets: {len(meets_to_process)} target meets (2025-26 season)")
+
+            # Enrich target meets with discoverable metadata (end_date/facility/host_gym/etc)
+            # before upsert so DB gets more complete meet records.
+            try:
+                target_states = sorted(
+                    {str(m.get("state")).upper() for m in meets_to_process if m.get("state")}
+                ) or args.states
+                discovered = discover_meets(states=target_states)
+                meets_to_process = _merge_missing_meet_metadata(meets_to_process, discovered)
+                print(f"  Metadata enrichment: merged from {len(discovered)} discovered meets")
+            except Exception as exc:
+                print(f"  Metadata enrichment skipped: {exc}")
         else:
             print(f"  Mode: Auto-discovery from MSO")
             print(f"  States: {', '.join(args.states)}")
@@ -1031,6 +1070,7 @@ def _run_ingest_core(args) -> tuple[int, int]:
                 except Exception:
                     fp = None
 
+                skip_due_to_no_change = False
                 if fp:
                     db = SessionLocal()
                     try:
@@ -1051,17 +1091,33 @@ def _run_ingest_core(args) -> tuple[int, int]:
                                 db.flush()
 
                             if state.last_fingerprint == fp:
+                                # Only skip unchanged fingerprints when this meet already has scores.
+                                # If no scores exist yet, keep scraping to avoid "stuck at zero rows".
+                                existing_score = (
+                                    db.query(Score.id)
+                                    .filter(Score.meet_id == meet_row.id)
+                                    .first()
+                                )
                                 state.last_polled_at = now
                                 db.commit()
-                                print(f"      [{i+1}] {name} - no change detected, skipping")
-                                continue
-
-                            state.last_fingerprint = fp
-                            state.last_polled_at = now
-                            state.last_changed_at = now
-                            db.commit()
+                                if existing_score:
+                                    print(f"      [{i+1}] {name} - no change detected, skipping")
+                                    skip_due_to_no_change = True
+                                else:
+                                    print(
+                                        f"      [{i+1}] {name} - fingerprint unchanged but no saved scores yet; retrying scrape"
+                                    )
+                            else:
+                                # New fingerprint seen; mark poll time now.
+                                # We promote last_fingerprint after a non-empty scrape below.
+                                state.last_polled_at = now
+                                db.commit()
+                                skip_due_to_no_change = False
                     finally:
                         db.close()
+
+                if skip_due_to_no_change:
+                    continue
 
                 # Try the API scraper only when explicitly enabled; otherwise go straight to HTML.
                 raw_rows = scrape_mso_meet_api(mso_url) if MSO_API_ENABLED else []
@@ -1173,6 +1229,32 @@ def _run_ingest_core(args) -> tuple[int, int]:
                     print(
                         f"            → saved: {saved} new score records  |  skipped: {dupes} dupes"
                     )
+
+                    # Promote fingerprint only after we actually scraped non-empty data.
+                    if fp:
+                        db = SessionLocal()
+                        try:
+                            meet_row = db.query(Meet).filter(Meet.meet_id == meet["meet_id"]).first()
+                            if meet_row:
+                                state = (
+                                    db.query(IngestSourceState)
+                                    .filter(
+                                        IngestSourceState.meet_id == meet_row.id,
+                                        IngestSourceState.source == "mso_results",
+                                    )
+                                    .first()
+                                )
+                                if not state:
+                                    state = IngestSourceState(meet_id=meet_row.id, source="mso_results")
+                                    db.add(state)
+                                    db.flush()
+                                now = datetime.utcnow()
+                                state.last_fingerprint = fp
+                                state.last_polled_at = now
+                                state.last_changed_at = now
+                                db.commit()
+                        finally:
+                            db.close()
                 else:
                     print(f"            → no rows found (meet may not have results yet)")
 
