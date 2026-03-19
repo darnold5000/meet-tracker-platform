@@ -211,7 +211,7 @@ TARGET_MEETS = [
     #     "source": "mso", "state": "IN",
     #     "start_date": "2026-03-13", "location": "Crown Pointe, IN",
     # }
-    # {
+    {
         "meet_id": "MSO-36489",
         "name": "2026 I AM Classic Meet",
         "mso_url": "https://www.meetscoresonline.com/R36489",
