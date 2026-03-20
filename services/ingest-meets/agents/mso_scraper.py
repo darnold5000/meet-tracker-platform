@@ -663,9 +663,18 @@ def _extract_score_row(row: Dict, meet_id: str) -> List[Dict]:
         row.get("athlete") or row.get("gymnast")
         or row.get("name") or row.get("athlete_name") or ""
     ).strip()
-    gym = (row.get("gym") or row.get("club") or row.get("team") or "").strip()
-    if not athlete or not gym or len(athlete) < 3 or athlete.lower() in ("totals", "total", "team"):
+    gym = (
+        row.get("gym")
+        or row.get("gym_name")
+        or row.get("club")
+        or row.get("club_name")
+        or row.get("team")
+        or ""
+    ).strip()
+    if not athlete or len(athlete) < 3 or athlete.lower() in ("totals", "total", "team"):
         return []
+    if not gym:
+        gym = "Unknown Gym"
 
     vault  = _decode_mso_score(row.get("vault", ""))
     bars   = _decode_mso_score(row.get("bars", "") or row.get("uneven_bars", ""))
