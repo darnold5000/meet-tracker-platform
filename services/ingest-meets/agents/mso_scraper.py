@@ -392,12 +392,28 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
         )
         last_heartbeat_at = now
 
+    logged_table_shape = False
+
     def collect_rows(pg):
+        nonlocal logged_table_shape
         from bs4 import BeautifulSoup
         html = pg.content()
         soup = BeautifulSoup(html, "lxml")
         found = []
-        for table in soup.select("table"):
+        tables = soup.select("table")
+        if not logged_table_shape:
+            logger.info("  HTML scan: found %d tables", len(tables))
+            if tables:
+                try:
+                    first_rows = []
+                    for t in tables[:3]:
+                        tr = t.select_one("tr")
+                        first_rows.append(tr.get_text(" ", strip=True)[:180] if tr else "")
+                    logger.info("  HTML scan: first-row previews: %s", first_rows)
+                except Exception:
+                    pass
+            logged_table_shape = True
+        for table in tables:
             for row in _parse_result_table(table, meet_id):
                 key = f"{row.get('athlete_name')}|{row.get('level')}|{row.get('event')}|{row.get('score')}"
                 if key not in seen_keys and row.get('athlete_name'):
@@ -582,6 +598,9 @@ def _parse_result_table(table, meet_id: str) -> List[Dict]:
     """Parse a single rendered result <table>."""
     rows = []
     headers = []
+    header_like_words = (
+        "athlete", "gym", "club", "team", "vault", "bars", "beam", "floor", "aa", "level", "division", "session"
+    )
 
     for tr in table.select("tr"):
         # Skip header rows
@@ -589,6 +608,16 @@ def _parse_result_table(table, meet_id: str) -> List[Dict]:
             cells = [td.get_text(strip=True) for td in tr.select("th, td")]
             headers = [_normalize_header(c) for c in cells]
             continue
+
+        # Some MSO tables use first <td> row as header (no <th> tags).
+        if not headers:
+            first_cells = [td.get_text(strip=True) for td in tr.select("td")]
+            normalized_first = [_normalize_header(c) for c in first_cells]
+            if normalized_first and any(
+                any(word in h for word in header_like_words) for h in normalized_first
+            ):
+                headers = normalized_first
+                continue
         
         # Skip template rows
         cells_text = [td.get_text(strip=True) for td in tr.select("td")]
