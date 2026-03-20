@@ -10,6 +10,7 @@ all session tabs, and reads the fully rendered score tables.
 import logging
 import re
 import os
+import time
 from datetime import datetime
 from typing import Dict, List, Optional
 import hashlib
@@ -372,6 +373,24 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
     """
     rows = []
     seen_keys = set()
+    heartbeat_every_s = 30.0
+    started_at = time.monotonic()
+    last_heartbeat_at = started_at
+
+    def heartbeat(stage: str):
+        nonlocal last_heartbeat_at
+        now = time.monotonic()
+        if (now - last_heartbeat_at) < heartbeat_every_s:
+            return
+        elapsed = int(now - started_at)
+        logger.info(
+            "  scrape heartbeat (%ss): %s | rows=%d | unique_keys=%d",
+            elapsed,
+            stage,
+            len(rows),
+            len(seen_keys),
+        )
+        last_heartbeat_at = now
 
     def collect_rows(pg):
         from bs4 import BeautifulSoup
@@ -446,6 +465,7 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
             logger.info("  Iterating through %d session tabs (Combined had %d rows)", 
                        len(session_tab_selectors), len(combined_rows))
             for i, tab in enumerate(session_tab_selectors):
+                heartbeat(f"session-tab loop {i + 1}/{len(session_tab_selectors)}")
                 try:
                     _dismiss_overlay(page)
                     tab.click(timeout=3000)
@@ -508,6 +528,7 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
 
                 for i in indices_to_scrape:
                     text = item_texts[i]
+                    heartbeat(f"session-picker loop {i + 1}/{len(indices_to_scrape)}")
                     if 'combined' in text.lower():
                         continue
                     try:
@@ -548,6 +569,8 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
                 logger.warning("  Could not iterate session picker items: %s", exc)
 
         page.close()
+        elapsed = int(time.monotonic() - started_at)
+        logger.info("  scrape complete (%ss): %d rows", elapsed, len(rows))
 
     except Exception as exc:
         logger.error("Playwright failed on %s: %s", result_url, exc)

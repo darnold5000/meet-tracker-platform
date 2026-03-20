@@ -46,6 +46,9 @@ logger = logging.getLogger("ingest")
 
 # MSO "API" frequently returns HTML; default to skipping it in live polling.
 MSO_API_ENABLED = os.getenv("MSO_API_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_TARGET_METADATA_ENRICHMENT = os.getenv("ENABLE_TARGET_METADATA_ENRICHMENT", "1").strip().lower() in {
+    "1", "true", "yes", "on"
+}
 
 # ---------------------------------------------------------------------------
 # CLI args
@@ -990,15 +993,18 @@ def _run_ingest_core(args) -> tuple[int, int]:
 
             # Enrich target meets with discoverable metadata (end_date/facility/host_gym/etc)
             # before upsert so DB gets more complete meet records.
-            try:
-                target_states = sorted(
-                    {str(m.get("state")).upper() for m in meets_to_process if m.get("state")}
-                ) or args.states
-                discovered = discover_meets(states=target_states)
-                meets_to_process = _merge_missing_meet_metadata(meets_to_process, discovered)
-                print(f"  Metadata enrichment: merged from {len(discovered)} discovered meets")
-            except Exception as exc:
-                print(f"  Metadata enrichment skipped: {exc}")
+            if ENABLE_TARGET_METADATA_ENRICHMENT:
+                try:
+                    target_states = sorted(
+                        {str(m.get("state")).upper() for m in meets_to_process if m.get("state")}
+                    ) or args.states
+                    discovered = discover_meets(states=target_states)
+                    meets_to_process = _merge_missing_meet_metadata(meets_to_process, discovered)
+                    print(f"  Metadata enrichment: merged from {len(discovered)} discovered meets")
+                except Exception as exc:
+                    print(f"  Metadata enrichment skipped: {exc}")
+            else:
+                print("  Metadata enrichment: disabled (ENABLE_TARGET_METADATA_ENRICHMENT=0)")
         else:
             print(f"  Mode: Auto-discovery from MSO")
             print(f"  States: {', '.join(args.states)}")
