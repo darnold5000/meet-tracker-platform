@@ -95,6 +95,24 @@ def _extract_mdy(text: str) -> Optional[str]:
         return None
 
 
+def _session_picker_indices_for_today(item_texts: list[str], today_mdy: str) -> list[int]:
+    """
+    Date-based MSO meets: a row like "Today (Fri) 3/20/2026" sets the active day; following
+    rows are sessions ("01 - Level 6 ...") with NO date in the text. A naive filter that only
+    keeps lines containing M/D/YYYY misses those sessions → 0 rows scraped.
+    Carry forward the most recent date header and include every item under today's date.
+    """
+    indices: list[int] = []
+    current_mdy: Optional[str] = None
+    for idx, t in enumerate(item_texts):
+        m = _extract_mdy(t)
+        if m:
+            current_mdy = m
+        if current_mdy == today_mdy:
+            indices.append(idx)
+    return indices
+
+
 # JavaScript to remove MSO's "All Access Pass" paywall overlay
 DISMISS_OVERLAY_JS = """
     ['showmessage_overlay', 'showmessage', 'IGCOfferModal'].forEach(id => {
@@ -307,19 +325,24 @@ def fingerprint_mso_results_page_with_context(context, mso_url: str) -> Optional
                 today_mdy = _today_in_mso_tz()
                 has_any_dates = any(_extract_mdy(t) for t in item_texts)
                 if has_any_dates:
-                    # Prefer explicit today match; otherwise leave selection alone.
-                    for idx, txt in enumerate(item_texts):
-                        if _extract_mdy(txt) == today_mdy:
-                            try:
-                                target = picker_items[idx]
-                                _dismiss_overlay(page)
-                                target.click(timeout=2500)
-                            except Exception:
-                                _dismiss_overlay(page)
-                                page.evaluate("el => el.click()", picker_items[idx])
-                            page.wait_for_timeout(600)
-                            _dismiss_overlay(page)
+                    idxs = _session_picker_indices_for_today(item_texts, today_mdy)
+                    if not idxs:
+                        idxs = list(range(len(picker_items)))
+                    chosen = idxs[-1]
+                    for cand in reversed(idxs):
+                        tx = item_texts[cand]
+                        if re.search(r"\d\s*-\s*", tx) or "level" in tx.lower():
+                            chosen = cand
                             break
+                    try:
+                        target = picker_items[chosen]
+                        _dismiss_overlay(page)
+                        target.click(timeout=2500)
+                    except Exception:
+                        _dismiss_overlay(page)
+                        page.evaluate("el => el.click()", picker_items[chosen])
+                    page.wait_for_timeout(600)
+                    _dismiss_overlay(page)
             except Exception:
                 pass
 
@@ -598,23 +621,17 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
                     today_mdy = _today_in_mso_tz()
                     has_any_dates = any(_extract_mdy(t) for t in item_texts)
                     if has_any_dates:
-                        filtered = []
-                        for idx, t in enumerate(item_texts):
-                            mdy = _extract_mdy(t)
-                            if mdy is None:
-                                continue
-                            if mdy == today_mdy:
-                                filtered.append((idx, t))
-                        if filtered:
+                        indices_to_scrape = _session_picker_indices_for_today(item_texts, today_mdy)
+                        logger.info(
+                            "  Today-only sessions (%s): %d picker items (date + sessions under that day)",
+                            today_mdy,
+                            len(indices_to_scrape),
+                        )
+                        if not indices_to_scrape:
                             logger.info(
-                                "  Today-only sessions enabled (%s): %d of %d items match",
-                                today_mdy,
-                                len(filtered),
+                                "  No items under today's date header; scraping all %d picker items",
                                 len(item_texts),
                             )
-                            indices_to_scrape = [i for i, _ in filtered]
-                        else:
-                            # No "today" match; fall back to scraping all to avoid missing meets in other TZs.
                             indices_to_scrape = list(range(len(item_texts)))
                     else:
                         indices_to_scrape = list(range(len(item_texts)))

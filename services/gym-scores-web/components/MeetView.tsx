@@ -10,7 +10,7 @@ import { ScoreCard } from "./ScoreCard";
 const DEFAULT_MEET_KEY = process.env.NEXT_PUBLIC_DEFAULT_MEET_KEY ?? "MSO-36541";
 /** Shown in the meet dropdown if this meet is not in the API list yet (e.g. before ingest upsert). */
 const DEFAULT_MEET_LABEL = "2026 Indiana Optional State Championships";
-const REFRESH_INTERVAL_MS = 20_000;
+const REFRESH_INTERVAL_MS = 60_000;
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -440,6 +440,12 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
             </div>
           </label>
         </div>
+        <p className="mb-1 text-[11px] leading-snug text-slate-500">
+          <span className="font-semibold text-slate-600">About results: </span>
+          Scores from <strong>public sources</strong> are entered and updated <strong>by the meet director</strong>, on
+          their own timeline. This app only reflects what appears there after we pull data—timing and completeness are{" "}
+          <strong>not controlled by us</strong>.
+        </p>
         <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-2 text-xs font-medium text-slate-700">
           <label className="col-span-1 flex items-center gap-1.5">
             <span>Session</span>
@@ -601,7 +607,7 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
                 onChange={(e) => setAutoRefresh(e.target.checked)}
                 className="rounded"
               />
-              Auto-refresh live scores (every 20s)
+              Auto-refresh live scores
             </label>
           )}
         </div>
@@ -641,8 +647,9 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
         >
           <p className="font-semibold">No scores yet for this meet</p>
           <p className="mt-1 text-amber-900/90">
-            Scores haven&apos;t been updated in the database yet. They will appear here after the ingest job runs and
-            loads results from MeetScoresOnline.
+            Nothing is in our database for this meet yet—often because the director hasn&apos;t published scores to{" "}
+            <strong>public sources</strong> yet, or our sync hasn&apos;t run. Even when public listings show names or
+            &quot;in progress,&quot; full scores appear only when the meet staff post them.
           </p>
         </div>
       )}
