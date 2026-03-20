@@ -24,14 +24,12 @@ from fastapi.templating import Jinja2Templates
 sys.path.insert(0, str(PROJECT_DIR))
 
 from gym_scores.db import fetch_all, fetch_one  # noqa: E402
-# One-meet MVP (easy to extend later). This is the `meets.meet_id` value in the `06` DB.
-DEFAULT_MEET_KEY = os.getenv("GYM_SCORES_MEET_KEY", "MSO-36478")
+# Default HTML meet + `/api/meets` allowlist (`meets.meet_id` in DB). Comma-separated.
+DEFAULT_MEET_KEY = os.getenv("GYM_SCORES_MEET_KEY", "MSO-36541")
+_DEFAULT_ALLOWED = "MSO-36541"
 ALLOWED_MEET_IDS = [
     m.strip()
-    for m in os.getenv(
-        "GYM_SCORES_ALLOWED_MEET_IDS",
-        "",
-    ).split(",")
+    for m in os.getenv("GYM_SCORES_ALLOWED_MEET_IDS", _DEFAULT_ALLOWED).split(",")
     if m.strip()
 ]
 
@@ -308,9 +306,10 @@ def _list_allowed_meets(meet_ids: list[str]) -> list[dict]:
         return []
     params = {f"m{i}": mid for i, mid in enumerate(meet_ids)}
     placeholders = ", ".join(f":m{i}" for i in range(len(meet_ids)))
+    # List from `meets` only so new meets appear before any scores are ingested.
     return fetch_all(
         f"""
-        SELECT DISTINCT
+        SELECT
           m.meet_id,
           m.name,
           m.location,
@@ -320,7 +319,6 @@ def _list_allowed_meets(meet_ids: list[str]) -> list[dict]:
           m.start_date,
           m.end_date
         FROM meets m
-        JOIN scores s ON s.meet_id = m.id
         WHERE m.meet_id IN ({placeholders})
         ORDER BY m.start_date DESC NULLS LAST, m.name
         """,
