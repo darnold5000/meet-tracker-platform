@@ -21,6 +21,16 @@ logger = logging.getLogger(__name__)
 MSO_BASE = "https://www.meetscoresonline.com"
 PAGE_LOAD_TIMEOUT = 20000
 DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+)
 
 # When enabled, only scrape session-picker items that match "today" in the given timezone.
 MSO_ONLY_TODAY_SESSIONS = os.getenv("MSO_ONLY_TODAY_SESSIONS", "1").strip().lower() in {
@@ -30,6 +40,32 @@ MSO_ONLY_TODAY_SESSIONS = os.getenv("MSO_ONLY_TODAY_SESSIONS", "1").strip().lowe
     "on",
 }
 MSO_TZ = os.getenv("MSO_TZ", "America/New_York").strip() or "America/New_York"
+MSO_MOBILE_EMULATION = os.getenv("MSO_MOBILE_EMULATION", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def get_playwright_context_kwargs() -> Dict:
+    """Build Playwright context config for normal desktop scraping."""
+    # Even if MSO_MOBILE_EMULATION is set, we keep the scraper in its
+    # original desktop mode for lightweight ingest.
+    return {"user_agent": DEFAULT_UA}
+
+
+def _harden_playwright_context(context) -> None:
+    """Reduce obvious automation fingerprints."""
+    try:
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        context.add_init_script(
+            "window.chrome = window.chrome || { runtime: {} };"
+        )
+    except Exception:
+        pass
 
 
 def _today_in_mso_tz() -> str:
@@ -64,6 +100,21 @@ DISMISS_OVERLAY_JS = """
     ['showmessage_overlay', 'showmessage', 'IGCOfferModal'].forEach(id => {
         var el = document.getElementById(id);
         if (el) el.style.display = 'none';
+    });
+    ['popup_block', 'igc-offer', 'IGCOffer', 'offer-modal'].forEach(id => {
+        var el = document.getElementById(id);
+        if (el) {
+            el.style.display = 'none';
+            el.style.pointerEvents = 'none';
+            if (el.parentNode) { try { el.parentNode.removeChild(el); } catch(e) {} }
+        }
+    });
+    document.querySelectorAll(
+        '#popup_block, [name="igc-offer"], [class*="igc"], [class*="offer"], [id*="offer"]'
+    ).forEach(e => {
+        e.style.display = 'none';
+        e.style.pointerEvents = 'none';
+        try { e.remove(); } catch(err) {}
     });
     document.querySelectorAll(
         '.modal-backdrop, .modal.show, [id*="overlay"], [id*="modal"]'
@@ -208,7 +259,7 @@ def scrape_mso_meet(mso_url: str) -> List[Dict]:
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=DEFAULT_UA)
+        context = browser.new_context(**get_playwright_context_kwargs())
         try:
             return scrape_mso_meet_with_context(context, mso_url)
         finally:
@@ -243,7 +294,7 @@ def fingerprint_mso_results_page_with_context(context, mso_url: str) -> Optional
         if MSO_ONLY_TODAY_SESSIONS:
             try:
                 _dismiss_overlay(page)
-                page.click('a.session.btn', timeout=2500)
+                _open_session_dropdown(page, timeout_ms=2500)
                 page.wait_for_timeout(300)
                 picker_items = page.query_selector_all(".session-picker-item")
                 item_texts = []
@@ -314,7 +365,7 @@ def fingerprint_mso_results_page(mso_url: str) -> Optional[str]:
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=DEFAULT_UA)
+            context = browser.new_context(**get_playwright_context_kwargs())
             try:
                 return fingerprint_mso_results_page_with_context(context, mso_url)
             finally:
@@ -328,9 +379,37 @@ def _dismiss_overlay(page) -> None:
     """Remove MSO's paywall/modal overlay so the page is fully interactive."""
     try:
         page.evaluate(DISMISS_OVERLAY_JS)
+        # Force-clear any fixed elements still intercepting clicks.
+        page.evaluate(
+            "() => { document.querySelectorAll('[style*=\"position: fixed\"], [style*=\"z-index\"]').forEach(el => {"
+            "const id=(el.id||'').toLowerCase(); const cls=(el.className||'').toString().toLowerCase();"
+            "if (id.includes('offer') || id.includes('popup') || cls.includes('offer') || cls.includes('popup')) {"
+            "el.style.pointerEvents='none'; el.style.display='none'; } }); }"
+        )
         page.wait_for_timeout(400)
     except Exception:
         pass
+
+
+def _open_session_dropdown(page, timeout_ms: int = 5000) -> None:
+    """Open the MSO session dropdown with resilient click fallbacks."""
+    _dismiss_overlay(page)
+    try:
+        page.click("a.session.btn", timeout=timeout_ms)
+        return
+    except Exception:
+        pass
+    _dismiss_overlay(page)
+    try:
+        page.locator("a.session.btn").first.click(timeout=timeout_ms, force=True)
+        return
+    except Exception:
+        pass
+    _dismiss_overlay(page)
+    # Final fallback: JS click bypasses pointer interception.
+    page.evaluate(
+        "() => { const el = document.querySelector('a.session.btn'); if (el) el.click(); }"
+    )
 
 
 def _resolve_result_urls(context, slug_url: str) -> List[str]:
@@ -441,7 +520,7 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
         combined_rows = []
         try:
             _dismiss_overlay(page)
-            page.click('a.session.btn', timeout=5000)
+            _open_session_dropdown(page, timeout_ms=5000)
             page.wait_for_timeout(800)
 
             # Click the "Combined" option in the session picker
@@ -500,7 +579,7 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
         if len(rows) < 30:
             try:
                 _dismiss_overlay(page)
-                page.click('a.session.btn', timeout=5000)
+                _open_session_dropdown(page, timeout_ms=5000)
                 page.wait_for_timeout(1500)
                 picker_items = page.query_selector_all('.session-picker-item')
                 logger.info("  Found %d session picker items to iterate", len(picker_items))
@@ -550,7 +629,7 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
                     try:
                         # Re-open the dropdown before each click (it closes after each selection)
                         _dismiss_overlay(page)
-                        page.click('a.session.btn', timeout=5000)
+                        _open_session_dropdown(page, timeout_ms=5000)
                         page.wait_for_timeout(800)
 
                         # Re-query items after re-opening the dropdown
@@ -599,7 +678,23 @@ def _parse_result_table(table, meet_id: str) -> List[Dict]:
     rows = []
     headers = []
     header_like_words = (
-        "athlete", "gym", "club", "team", "vault", "bars", "beam", "floor", "aa", "level", "division", "session"
+        "athlete",
+        "gymnast",
+        "name",
+        "gym",
+        "club",
+        "team",
+        "vault",
+        "bars",
+        "beam",
+        "floor",
+        "aa",
+        "level",
+        "lvl",
+        "division",
+        "div",
+        "session",
+        "sess",
     )
 
     for tr in table.select("tr"):
@@ -814,14 +909,34 @@ def _normalize_place(raw_place) -> Optional[int]:
 
 def _decode_mso_score(raw: str) -> Optional[float]:
     """
-    Decode MSO's encoded score value.
-    Format: [place_digits][T?][4_score_digits]
-    Score digits are rotated left by 1: 9.500 stored as '5009'
-    Decode by rotating right: '5009' → '9500' → 9.500
+    Decode MSO score cells.
+
+    Some pages render plain decimals (e.g. "9.500"); others use encoded digits-only
+    blobs (last 4 digits rotated: 9.500 → '5009').
     """
     if not raw:
         return None
-    clean = re.sub(r'[^0-9]', '', str(raw))
+    s = str(raw).strip()
+    # Plain decimal (common on newer / simplified MSO tables)
+    plain = re.search(r"\b(\d{1,2}\.\d{1,4})\b", s)
+    if plain:
+        try:
+            val = float(plain.group(1))
+            if 0.0 <= val <= 10.0:
+                return round(val, 4)
+        except ValueError:
+            pass
+    # Whole-number scores sometimes appear without decimals
+    whole = re.fullmatch(r"(\d{1,2})", re.sub(r"\s+", "", s))
+    if whole:
+        try:
+            val = float(whole.group(1))
+            if 0.0 <= val <= 10.0:
+                return val
+        except ValueError:
+            pass
+
+    clean = re.sub(r"[^0-9]", "", s)
     if len(clean) < 4:
         return None
     score_encoded = clean[-4:]

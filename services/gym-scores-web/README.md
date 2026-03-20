@@ -40,7 +40,7 @@ Next.js frontend for live gymnastics meet scores. **Calls the FastAPI backend** 
 ## Features (scaffold)
 
 - **Live scores** – list of athletes with VT/UB/BB/FX/AA scores for the selected meet.
-- **Filters** – level, division, search (athlete/gym).
+- **Filters** – session, level, division, gym, athlete.
 - **Event switch** – sort and highlight by VT, UB, BB, FX, or AA.
 - **Auto-refresh** – optional polling every 20s (toggle in UI).
 

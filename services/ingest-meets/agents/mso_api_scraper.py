@@ -18,13 +18,54 @@ Query Parameters:
 import logging
 import re
 import html
+import os
 from typing import Dict, List, Optional
 import requests
+import json
 
 logger = logging.getLogger(__name__)
 
 MSO_BASE = "https://www.meetscoresonline.com"
-MSO_API_ENDPOINT = f"{MSO_BASE}/Ajax.Projects.Json.msoMeet.aspx"
+# MSO's endpoint naming seems to vary slightly between deployments/clients:
+# - Ajax.Projects.Json.msoMeet.aspx
+# - Ajax.ProjectsJson.msoMeet.aspx
+MSO_API_ENDPOINTS = [
+    f"{MSO_BASE}/Ajax.Projects.Json.msoMeet.aspx",
+    f"{MSO_BASE}/Ajax.ProjectsJson.msoMeet.aspx",
+]
+DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+)
+MSO_MOBILE_EMULATION = os.getenv("MSO_MOBILE_EMULATION", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+def _context_kwargs() -> Dict:
+    # Keep original desktop mode (lightweight ingest).
+    return {"user_agent": DEFAULT_UA}
+
+
+def _harden_playwright_context(context) -> None:
+    """Reduce obvious automation fingerprints."""
+    try:
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        context.add_init_script("window.chrome = window.chrome || { runtime: {} };")
+    except Exception:
+        pass
 
 # Event mapping: EventScore1-4 -> event codes
 EVENT_MAP = {
@@ -33,6 +74,181 @@ EVENT_MAP = {
     3: "BB",  # Beam
     4: "FX",  # Floor
 }
+
+
+def _is_valid_session_code(code: Optional[str]) -> bool:
+    """
+    Accept MSO session formats seen in the wild:
+    - 01A, 09B (most common in current feeds)
+    - A01, B03 (legacy pattern)
+    """
+    if not code:
+        return False
+    s = str(code).strip().upper()
+    return bool(re.match(r"^(\d{2}[A-Z]|[A-Z]\d{2})$", s))
+
+
+def _overlay_dismiss_js() -> str:
+    return """
+        ['showmessage_overlay', 'showmessage', 'IGCOfferModal'].forEach(id => {
+            var el = document.getElementById(id);
+            if (el) el.style.display = 'none';
+        });
+        ['popup_block', 'igc-offer', 'IGCOffer', 'offer-modal'].forEach(id => {
+            var el = document.getElementById(id);
+            if (el) {
+                el.style.display = 'none';
+                el.style.pointerEvents = 'none';
+                if (el.parentNode) { try { el.parentNode.removeChild(el); } catch(e) {} }
+            }
+        });
+        document.querySelectorAll(
+            '#popup_block, [name="igc-offer"], [class*="igc"], [class*="offer"], [id*="offer"]'
+        ).forEach(e => {
+            e.style.display = 'none';
+            e.style.pointerEvents = 'none';
+            try { e.remove(); } catch(err) {}
+        });
+        document.querySelectorAll(
+            '.modal-backdrop, .modal.show, [id*="overlay"], [id*="modal"]'
+        ).forEach(e => e.style.display = 'none');
+        document.body.style.overflow = 'auto';
+    """
+
+
+def _fetch_scores_from_page_network(meet_id: str) -> List[Dict]:
+    """
+    Fallback: capture MSO's own lookup_scores JSON responses from browser network.
+    This bypasses desktop rendering/template bugs where table rows are not drawn.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return []
+
+    captured_payloads: List[dict] = []
+    seen_urls = set()
+    meet_url = f"{MSO_BASE}/R{meet_id}"
+
+    def _maybe_capture(resp):
+        try:
+            # MSO puts the useful discriminator (QueryID=lookup_scores) inside the JSON,
+            # so don't rely on it being present in the URL.
+            if "msoMeet.aspx" not in resp.url:
+                return
+            if "Ajax" not in resp.url:
+                return
+            if resp.status != 200:
+                return
+            if resp.url in seen_urls:
+                return
+            payload = None
+            try:
+                payload = resp.json()
+            except Exception:
+                # Some responses may be served with a misleading content-type
+                txt = resp.text()
+                try:
+                    payload = json.loads(txt)
+                except Exception:
+                    payload = None
+
+            if isinstance(payload, dict) and payload.get("results"):
+                seen_urls.add(resp.url)
+                captured_payloads.append(payload)
+        except Exception:
+            pass
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(**_context_kwargs())
+        page = context.new_page()
+        page.on("response", _maybe_capture)
+
+        page.goto(meet_url, timeout=30000, wait_until="networkidle")
+        page.wait_for_timeout(1500)
+        try:
+            page.evaluate(_overlay_dismiss_js())
+        except Exception:
+            pass
+        page.wait_for_timeout(1000)
+
+        # In practice, lookup_scores usually fires on initial render as well.
+        # We still attempt a couple session changes to trigger additional calls.
+        try:
+            for _ in range(1):
+                page.evaluate(_overlay_dismiss_js())
+                page.wait_for_timeout(300)
+                try:
+                    page.click("a.session.btn", timeout=2000, force=True)
+                except Exception:
+                    page.evaluate("() => { const el = document.querySelector('a.session.btn'); if (el) el.click(); }")
+                page.wait_for_timeout(700)
+                items = page.query_selector_all(".session-picker-item")
+                for idx, item in enumerate(items[:12]):
+                    txt = (item.inner_text() or "").strip().lower()
+                    if "combined" in txt:
+                        continue
+                    try:
+                        item.click(timeout=2000, force=True)
+                    except Exception:
+                        page.evaluate("(el) => el.click()", item)
+                    page.wait_for_timeout(1000)
+        except Exception:
+            pass
+
+        browser.close()
+
+    rows: List[Dict] = []
+    for payload in captured_payloads:
+        rows.extend(_parse_api_response(payload, meet_id))
+    if rows:
+        logger.info(
+            "Captured %d lookup_scores payloads via network fallback → %d rows",
+            len(captured_payloads),
+            len(rows),
+        )
+    return rows
+
+
+def _common_session_guesses(limit_per_letter: int = 10) -> List[str]:
+    """
+    Session codes MSO has used in current dropdowns:
+    - 01A, 03B, etc.
+    Keep this bounded to avoid long runtimes when session discovery fails.
+    """
+    guesses: List[str] = []
+    for suffix in ("A", "B", "C", "D"):
+        for i in range(1, limit_per_letter + 1):
+            guesses.append(f"{i:02d}{suffix}")
+    # Also include a few legacy variants for safety.
+    guesses.extend(["A01", "B01", "C01", "A02", "B02", "C02"])
+    return guesses
+
+
+def _try_parse_json_blob(text: str) -> Optional[dict]:
+    """Try to parse a JSON object from a response that might have wrong content-type."""
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+
+    # Try to extract the first {...} blob if response wraps JSON in HTML/script.
+    try:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            blob = text[start : end + 1]
+            parsed = json.loads(blob)
+            if isinstance(parsed, dict):
+                return parsed
+    except Exception:
+        pass
+    return None
 
 
 def scrape_mso_meet_api(mso_url: str) -> List[Dict]:
@@ -63,6 +279,20 @@ def scrape_mso_meet_api(mso_url: str) -> List[Dict]:
         rows = _fetch_scores_from_api(meet_id, session)
         all_rows.extend(rows)
         logger.info("  Session %s → %d rows", session or "ALL", len(rows))
+
+    if not all_rows:
+        logger.info("API calls returned 0 rows; trying session-guesses + network fallback")
+        session_guesses = _common_session_guesses(limit_per_letter=10)
+        for guess in session_guesses:
+            rows = _fetch_scores_from_api(meet_id, guess)
+            if rows:
+                all_rows.extend(rows)
+                logger.info("  Session guess %s → %d rows", guess, len(rows))
+                break
+
+    if not all_rows:
+        logger.info("Session guesses returned 0 rows; trying network-capture fallback")
+        all_rows = _fetch_scores_from_page_network(meet_id)
 
     logger.info("MSO API scraped %d total rows from %s", len(all_rows), mso_url)
     return all_rows
@@ -97,9 +327,7 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
         
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            )
+            context = browser.new_context(**_context_kwargs())
             page = context.new_page()
             page.goto(meet_url, timeout=30000, wait_until="networkidle")
             
@@ -107,16 +335,7 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
             page.wait_for_timeout(2000)
             
             # Dismiss any overlay using JavaScript injection (same approach as HTML scraper)
-            DISMISS_OVERLAY_JS = """
-                ['showmessage_overlay', 'showmessage', 'IGCOfferModal'].forEach(id => {
-                    var el = document.getElementById(id);
-                    if (el) el.style.display = 'none';
-                });
-                document.querySelectorAll(
-                    '.modal-backdrop, .modal.show, [id*="overlay"], [id*="modal"]'
-                ).forEach(e => e.style.display = 'none');
-                document.body.style.overflow = 'auto';
-            """
+            DISMISS_OVERLAY_JS = _overlay_dismiss_js()
             try:
                 page.evaluate(DISMISS_OVERLAY_JS)
                 page.wait_for_timeout(500)
@@ -140,7 +359,10 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
                         page.evaluate(DISMISS_OVERLAY_JS)
                         page.wait_for_timeout(500)
                         session_btn = page.wait_for_selector('a.session.btn', timeout=3000)
-                        session_btn.click(timeout=3000)
+                        try:
+                            session_btn.click(timeout=3000, force=True)
+                        except Exception:
+                            page.evaluate("() => { const el = document.querySelector('a.session.btn'); if (el) el.click(); }")
                     page.wait_for_timeout(1000)  # Wait for dropdown to open
                 except Exception as e:
                     logger.warning("Could not click session dropdown: %s", e)
@@ -181,7 +403,7 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
                             href = elem.get_attribute('href') or ''
                             # Look for session code in onclick/href
                             for attr_text in [onclick, href]:
-                                match = re.search(r'["\']([A-Z]\d{2})["\']', attr_text)
+                                match = re.search(r'["\']((?:\d{2}[A-Z])|(?:[A-Z]\d{2}))["\']', attr_text)
                                 if match:
                                     session_code = match.group(1)
                                     logger.debug("  Found via onclick/href: %s", session_code)
@@ -189,14 +411,14 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
                         
                         # Method 4: Extract from text content (e.g., "Session A01")
                         if not session_code:
-                            match = re.search(r'\b([A-Z]\d{2})\b', text)
+                            match = re.search(r'\b((?:\d{2}[A-Z])|(?:[A-Z]\d{2}))\b', text)
                             if match:
                                 session_code = match.group(1)
                                 logger.debug("  Found via text: %s", session_code)
                         
                         # Validate and add session code
-                        if session_code and re.match(r'^[A-Z]\d{2}$', session_code):
-                            sessions.add(session_code)
+                        if _is_valid_session_code(session_code):
+                            sessions.add(str(session_code).strip().upper())
                             logger.info("  Valid session code found: %s", session_code)
                         else:
                             logger.debug("  Could not extract valid session code from: %s", text)
@@ -213,10 +435,10 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
                     if script.string:
                         # Look for patterns like: sessions: ["A01", "B02"] or sessionList = ["A01"]
                         # More comprehensive pattern
-                        matches = re.findall(r'["\']([A-Z]\d{2})["\']', script.string)
+                        matches = re.findall(r'["\']((?:\d{2}[A-Z])|(?:[A-Z]\d{2}))["\']', script.string)
                         for match in matches:
-                            if re.match(r'^[A-Z]\d{2}$', match):
-                                sessions.add(match)
+                            if _is_valid_session_code(match):
+                                sessions.add(str(match).strip().upper())
                                 logger.debug("Found session code from script: %s", match)
                 
             except Exception as e:
@@ -227,7 +449,11 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
             browser.close()
             
             # Filter out template placeholders and invalid session codes
-            valid_sessions = {s for s in sessions if s and not s.startswith('#') and re.match(r'^[A-Z]\d{2}$', s)}
+            valid_sessions = {
+                str(s).strip().upper()
+                for s in sessions
+                if s and not str(s).startswith("#") and _is_valid_session_code(str(s))
+            }
             
             if valid_sessions:
                 session_list = sorted(list(valid_sessions))
@@ -241,14 +467,17 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
     # Fallback: Try to discover sessions by testing common session codes
     # This is slower but works if HTML scraping fails
     logger.info("Trying to discover sessions by testing common codes")
-    common_sessions = ["A01", "A02", "A03", "A04", "A05", 
-                       "B01", "B02", "B03", "B04", "B05",
-                       "C01", "C02", "C03", "C04", "C05"]
+    # Include both legacy (A01/B02) and current (01A/09B) conventions.
+    common_sessions = [
+        "A01", "A02", "A03", "A04", "A05",
+        "B01", "B02", "B03", "B04", "B05",
+        "C01", "C02", "C03", "C04", "C05",
+    ] + [f"{i:02d}{suffix}" for i in range(1, 21) for suffix in ("A", "B", "C", "D")]
     
     # Use a session to maintain cookies
     test_session = requests.Session()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        "User-Agent": DEFAULT_UA,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Referer": f"{MSO_BASE}/Results/{meet_id}",
         "X-Requested-With": "XMLHttpRequest",
@@ -262,6 +491,7 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
         pass
     
     found_sessions = []
+    endpoint_urls = MSO_API_ENDPOINTS[:]
     for session_code in common_sessions:
         test_params = {
             "LookupIndex": "1",
@@ -274,22 +504,27 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
         }
         
         try:
-            resp = test_session.get(MSO_API_ENDPOINT, params=test_params, headers=headers, timeout=10)
-            if resp.status_code == 200:
+            for api_endpoint in endpoint_urls:
+                resp = test_session.get(
+                    api_endpoint, params=test_params, headers=headers, timeout=10
+                )
+                if resp.status_code != 200:
+                    continue
                 try:
                     data = resp.json()
-                    # Check if we got any rows back
-                    if isinstance(data, dict) and "results" in data:
-                        for result in data.get("results", []):
-                            if isinstance(result, dict) and "result" in result:
-                                rows = result.get("result", {}).get("row", [])
-                                if rows:
-                                    found_sessions.append(session_code)
-                                    logger.debug("Session %s has data", session_code)
-                                    break
                 except ValueError:
-                    # Not JSON, skip
-                    continue
+                    data = _try_parse_json_blob(resp.text)
+                # Check if we got any rows back
+                if isinstance(data, dict) and "results" in data:
+                    for result in data.get("results", []):
+                        if isinstance(result, dict) and "result" in result:
+                            rows = result.get("result", {}).get("row", [])
+                            if rows:
+                                found_sessions.append(session_code)
+                                logger.debug("Session %s has data", session_code)
+                                break
+                if found_sessions and found_sessions[-1] == session_code:
+                    break
         except Exception:
             continue
     
@@ -313,6 +548,9 @@ def _fetch_scores_from_api(meet_id: str, session: Optional[str] = None) -> List[
     Returns:
         List of score dicts
     """
+    # Try both endpoint spellings because they vary slightly.
+    endpoint_urls = MSO_API_ENDPOINTS[:]
+
     params = {
         "LookupIndex": "1",
         "p_meetid": meet_id,
@@ -324,7 +562,7 @@ def _fetch_scores_from_api(meet_id: str, session: Optional[str] = None) -> List[
     }
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": DEFAULT_UA,
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": f"{MSO_BASE}/Results/{meet_id}",
@@ -340,9 +578,7 @@ def _fetch_scores_from_api(meet_id: str, session: Optional[str] = None) -> List[
         
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-            )
+            context = browser.new_context(**_context_kwargs())
             page = context.new_page()
             
             # First visit the meet page to establish session
@@ -350,24 +586,42 @@ def _fetch_scores_from_api(meet_id: str, session: Optional[str] = None) -> List[
             page.goto(meet_url, timeout=30000, wait_until="networkidle")
             page.wait_for_timeout(1000)
             
-            # Now make the API call through the browser context
-            api_url_with_params = f"{MSO_API_ENDPOINT}?" + "&".join([f"{k}={v}" for k, v in params.items()])
-            
-            # Use page.request to make API call with browser cookies
-            api_resp = page.request.get(api_url_with_params, headers=headers)
-            
-            if api_resp.status == 200:
+            for api_endpoint in endpoint_urls:
+                # Now make the API call through the browser context
+                api_url_with_params = (
+                    f"{api_endpoint}?" + "&".join([f"{k}={v}" for k, v in params.items()])
+                )
+
+                # Use context.request so cookies/session from the browser context are included.
+                api_resp = context.request.get(api_url_with_params, headers=headers)
+
+                if api_resp.status != 200:
+                    logger.debug(
+                        "Playwright API call failed with status %s (endpoint=%s, session=%s)",
+                        api_resp.status,
+                        api_endpoint,
+                        session,
+                    )
+                    continue
+
                 try:
                     data = api_resp.json()
-                    browser.close()
                     rows = _parse_api_response(data, meet_id)
-                    return rows
-                except Exception as e:
-                    logger.debug("Playwright API call returned non-JSON: %s", e)
-                    browser.close()
-            else:
-                logger.debug("Playwright API call failed with status %s", api_resp.status)
-                browser.close()
+                    if rows:
+                        browser.close()
+                        return rows
+                except Exception:
+                    pass
+
+                raw_text = api_resp.text()
+                parsed = _try_parse_json_blob(raw_text)
+                if parsed:
+                    rows = _parse_api_response(parsed, meet_id)
+                    if rows:
+                        browser.close()
+                        return rows
+
+            browser.close()
     except ImportError:
         logger.debug("Playwright not available, trying requests")
     except Exception as e:
@@ -384,45 +638,45 @@ def _fetch_scores_from_api(meet_id: str, session: Optional[str] = None) -> List[
         logger.debug("Could not fetch meet page for cookies: %s", e)
 
     try:
-        resp = session_obj.get(MSO_API_ENDPOINT, params=params, headers=headers, timeout=30)
-        resp.raise_for_status()
-        
-        # Try to parse JSON regardless of content-type header
-        # Sometimes MSO returns JSON but with wrong content-type
-        data = None
-        try:
-            data = resp.json()
-        except ValueError:
-            # If JSON parsing fails, check content-type
-            content_type = resp.headers.get('Content-Type', '')
-            if 'application/json' not in content_type and 'text/javascript' not in content_type:
-                logger.warning("MSO API returned non-JSON content type: %s for meet %s", content_type, meet_id)
+        for api_endpoint in endpoint_urls:
+            resp = session_obj.get(
+                api_endpoint, params=params, headers=headers, timeout=30
+            )
+            resp.raise_for_status()
+
+            # Try to parse JSON regardless of content-type header.
+            data = None
+            try:
+                data = resp.json()
+            except ValueError:
+                data = _try_parse_json_blob(resp.text)
+
+            if not data:
+                content_type = resp.headers.get("Content-Type", "")
+                logger.warning(
+                    "MSO API returned unparseable payload type: %s for meet %s (session=%s) (endpoint=%s)",
+                    content_type,
+                    meet_id,
+                    session,
+                    api_endpoint,
+                )
                 logger.debug("Response text (first 500 chars): %s", resp.text[:500])
-                # Try POST method as fallback
                 logger.info("Trying POST method for meet %s", meet_id)
                 try:
-                    resp_post = session_obj.post(MSO_API_ENDPOINT, data=params, headers=headers, timeout=30)
+                    resp_post = session_obj.post(
+                        api_endpoint, data=params, headers=headers, timeout=30
+                    )
                     resp_post.raise_for_status()
-                    try:
-                        data = resp_post.json()
-                        logger.info("POST method succeeded for meet %s", meet_id)
-                    except ValueError:
-                        logger.warning("POST method also returned non-JSON for meet %s", meet_id)
-                        return []
-                except Exception as e:
-                    logger.debug("POST method failed: %s", e)
-                    return []
-            else:
-                # Content-type says JSON but parsing failed
-                logger.error("MSO API returned invalid JSON for meet %s", meet_id)
-                logger.debug("Response text (first 500 chars): %s", resp.text[:500])
-                return []
-        
-        if data is None:
-            return []
-        
-        rows = _parse_api_response(data, meet_id)
-        return rows
+                    data = _try_parse_json_blob(resp_post.text)
+                except Exception:
+                    data = None
+
+            if data:
+                rows = _parse_api_response(data, meet_id)
+                if rows:
+                    return rows
+
+        return []
 
     except requests.RequestException as exc:
         logger.error("MSO API request failed for meet %s: %s", meet_id, exc)

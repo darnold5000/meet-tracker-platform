@@ -28,9 +28,7 @@ from agents.mso_scraper import scrape_mso_meet, audit_duplicate_hashes, deduplic
 import logging
 import os
 import sys
-import re
 from datetime import datetime
-from typing import Optional
 from sqlalchemy.exc import IntegrityError
 
 
@@ -46,9 +44,6 @@ logger = logging.getLogger("ingest")
 
 # MSO "API" frequently returns HTML; default to skipping it in live polling.
 MSO_API_ENABLED = os.getenv("MSO_API_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_TARGET_METADATA_ENRICHMENT = os.getenv("ENABLE_TARGET_METADATA_ENRICHMENT", "1").strip().lower() in {
-    "1", "true", "yes", "on"
-}
 
 # ---------------------------------------------------------------------------
 # CLI args
@@ -101,7 +96,7 @@ from agents.meet_discovery import discover_meets
 from core.normalizer import normalize_mso_record, normalize_mso_api_record
 from core.gym_normalizer import normalize_gym_name as normalize_gym_name_canonical
 from db.database import SessionLocal, create_tables, engine
-from db.models import Meet, Athlete, AthleteAlias, Score, Gym, IngestSourceState, Session
+from db.models import Meet, Athlete, AthleteAlias, Score, Gym, IngestSourceState
 import hashlib
 
 # ---------------------------------------------------------------------------
@@ -112,22 +107,7 @@ import hashlib
 # Target meets for scraping (12 meets, excluding Tulip City which is not available via API)
 # All meets use the new MSO API scraper which includes placement data
 TARGET_MEETS = [
-    # Each entry is upserted to the DB when using --use-target-meets (step 1) before scraping scores.
     # --- Already discovered / in DB ---
-    {
-        "meet_id": "MSO-36541",
-        "name": "2026 Indiana Optional State Championships",
-        "mso_url": "https://meetscoresonline.com/Results/36541",
-        "source": "mso", "state": "IN",
-        "start_date": "2026-03-20", "location": "Bloomington, IN",
-    },
-    # {
-    #     "meet_id": "MSO-35799",
-    #     "name": "2026 Jaycie Phelps Midwest Showdown",
-    #     "mso_url": "https://www.meetscoresonline.com/R35799",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-01-23", "location": "French Lick, IN",
-    # },
     # {
     #     "meet_id": "MSO-35397",
     #     "name": "2025 North Pole Classic USAG",
@@ -141,6 +121,13 @@ TARGET_MEETS = [
     #     "mso_url": "https://www.meetscoresonline.com/R35120",
     #     "source": "mso", "state": "CA",
     #     "start_date": "2026-01-09", "location": "Anaheim, CA",
+    # },
+    # {
+    #     "meet_id": "MSO-35799",
+    #     "name": "2026 Jaycie Phelps Midwest Showdown",
+    #     "mso_url": "https://www.meetscoresonline.com/R35799",
+    #     "source": "mso", "state": "IN",
+    #     "start_date": "2026-01-23", "location": "French Lick, IN",
     # },
     # {
     #     "meet_id": "MSO-35846",
@@ -316,8 +303,6 @@ def save_meets(meets: list) -> tuple:
                 existing.start_date = _parse_date(m.get("start_date")) or existing.start_date
                 existing.end_date = _parse_date(m.get("end_date")) or existing.end_date
                 existing.location = m.get("location") or existing.location
-                existing.facility = m.get("facility") or existing.facility
-                existing.host_gym = m.get("host_gym") or existing.host_gym
                 existing.state = m.get("state") or existing.state
                 existing.mso_url = m.get("mso_url") or existing.mso_url
                 skipped += 1
@@ -328,10 +313,8 @@ def save_meets(meets: list) -> tuple:
                 name=m.get("name", "Unknown Meet"),
                 state=m.get("state"),
                 location=m.get("location"),
-                facility=m.get("facility"),
                 start_date=_parse_date(m.get("start_date")),
                 end_date=_parse_date(m.get("end_date")),
-                host_gym=m.get("host_gym"),
                 mso_url=m.get("mso_url"),
                 scorecat_url=m.get("scorecat_url"),
                 website_url=m.get("website_url"),
@@ -559,86 +542,6 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
     inserted = 0
     skipped = 0
 
-    session_cache: dict[tuple[Optional[int], Optional[datetime]], Optional[Session]] = {}
-
-    def _parse_session_metadata(raw: str) -> tuple[Optional[int], Optional[datetime]]:
-        """
-        Best-effort mapping from scraper session label -> (session_number, start_time).
-        This is intentionally tolerant because MSO session labels vary across meets.
-        """
-        if not raw:
-            return None, None
-
-        s = str(raw).strip()
-
-        # 1) Session number like "Session 01" or "Session 1"
-        m = re.search(r"Session\s*0*(\d+)", s, flags=re.IGNORECASE)
-        session_number: Optional[int] = int(m.group(1)) if m else None
-
-        # 2) Date like M/D/YYYY (also found in "Saturday 3/14/2026")
-        date_match = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", s)
-        start_time: Optional[datetime] = None
-        if date_match:
-            mm, dd, yyyy = (int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3)))
-            # 24h time parsing if present, otherwise midnight
-            time_match = re.search(r"(\d{1,2}):(\d{2})\s*(AM|PM)", s, flags=re.IGNORECASE)
-            if time_match:
-                hh = int(time_match.group(1))
-                minutes = int(time_match.group(2))
-                ampm = time_match.group(3).upper()
-                if ampm == "PM" and hh != 12:
-                    hh += 12
-                if ampm == "AM" and hh == 12:
-                    hh = 0
-                start_time = datetime(yyyy, mm, dd, hh, minutes)
-            else:
-                start_time = datetime(yyyy, mm, dd, 0, 0)
-
-        # 3) Many MSO session picker labels look like "01A", "02B", etc.
-        # Extract the leading digits even if the next char is a letter (no word boundary).
-        if session_number is None:
-            m2 = re.match(r"^\s*0*(\d+)", s)
-            if m2:
-                session_number = int(m2.group(1))
-
-        return session_number, start_time
-
-    def _get_or_create_session(
-        db,
-        *,
-        meet_db_id: int,
-        session_key: str,
-        session_number: Optional[int],
-        start_time: Optional[datetime],
-    ) -> Optional[Session]:
-        # If the scraper didn't give us anything useful, keep the FK null.
-        if not session_key:
-            return None
-
-        cache_key = (session_number, start_time)
-        if cache_key in session_cache:
-            return session_cache[cache_key]
-
-        q = db.query(Session).filter(Session.meet_id == meet_db_id)
-        if session_number is None:
-            q = q.filter(Session.session_number.is_(None))
-        else:
-            q = q.filter(Session.session_number == session_number)
-
-        if start_time is None:
-            q = q.filter(Session.start_time.is_(None))
-        else:
-            q = q.filter(Session.start_time == start_time)
-
-        sess = q.first()
-        if not sess:
-            sess = Session(meet_id=meet_db_id, session_number=session_number, start_time=start_time)
-            db.add(sess)
-            db.flush()
-
-        session_cache[cache_key] = sess
-        return sess
-
     # Individual event columns in the normalized row → event label
     EVENT_FIELDS = {
         "vault":  "VT",
@@ -671,8 +574,6 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
             gym_name = row.get("gym", "").strip()
             level = row.get("level")
             division = row.get("division")
-            session_key = str(row.get("session") or "").strip()
-            session_number, session_start_time = _parse_session_metadata(session_key)
 
             events_to_save = []
 
@@ -701,12 +602,7 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
             # Precompute record_hashes without touching the DB.
             hashes = []
             for event_label, score_val, _place in events_to_save:
-                # Include session in the hash only when we actually have a session label.
-                # This prevents different session-days from collapsing into the same row.
-                if session_key:
-                    hash_input = f"{meet.id}|{athlete_name}|{event_label}|{score_val}|{session_key}"
-                else:
-                    hash_input = f"{meet.id}|{athlete_name}|{event_label}|{score_val}"
+                hash_input = f"{meet.id}|{athlete_name}|{event_label}|{score_val}"
                 h = hashlib.sha256(hash_input.encode()).hexdigest()
                 hashes.append(h)
                 all_hashes.append(h)
@@ -718,9 +614,6 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
                     "level": level,
                     "division": division,
                     "source": row.get("source", "mso"),
-                    "session_key": session_key,
-                    "session_number": session_number,
-                    "session_start_time": session_start_time,
                     "events": events_to_save,
                     "hashes": hashes,
                 }
@@ -758,14 +651,6 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
                 skipped += len(plan["events"])
                 continue
 
-            session_obj = _get_or_create_session(
-                db,
-                meet_db_id=meet.id,
-                session_key=plan.get("session_key") or "",
-                session_number=plan.get("session_number"),
-                start_time=plan.get("session_start_time"),
-            )
-
             for (event_label, score_val, place), record_hash in zip(plan["events"], plan["hashes"]):
                 if record_hash in seen_hashes_in_batch or record_hash in existing_hashes:
                     skipped += 1
@@ -775,7 +660,6 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
                 score = Score(
                     athlete_id=athlete.id,
                     meet_id=meet.id,
-                    session_id=session_obj.id if session_obj else None,
                     event=event_label,
                     score=score_val,
                     place=place,
@@ -850,33 +734,6 @@ def format_sources(sources: dict) -> str:
         source_str += " | No data yet"
     
     return source_str
-
-
-def _merge_missing_meet_metadata(base_meets: list[dict], discovered_meets: list[dict]) -> list[dict]:
-    """
-    Fill missing metadata on base meets using discovered meets.
-    Match by meet_id first, then by normalized mso_url.
-    """
-    by_id = {m.get("meet_id"): m for m in discovered_meets if m.get("meet_id")}
-    by_url = {
-        str(m.get("mso_url", "")).strip().lower(): m
-        for m in discovered_meets
-        if m.get("mso_url")
-    }
-    fields = ["start_date", "end_date", "location", "facility", "host_gym", "state"]
-
-    merged: list[dict] = []
-    for m in base_meets:
-        out = dict(m)
-        src = by_id.get(out.get("meet_id"))
-        if not src and out.get("mso_url"):
-            src = by_url.get(str(out.get("mso_url")).strip().lower())
-        if src:
-            for f in fields:
-                if not out.get(f) and src.get(f):
-                    out[f] = src.get(f)
-        merged.append(out)
-    return merged
 
 
 def interactive_meet_selection(meets: list) -> list:
@@ -998,23 +855,6 @@ def _run_ingest_core(args) -> tuple[int, int]:
             print(f"  Mode: Using hardcoded TARGET_MEETS array")
             meets_to_process = TARGET_MEETS
             print(f"  Meets: {len(meets_to_process)} target meets (2025-26 season)")
-
-            # Enrich target meets with discoverable metadata (end_date/facility/host_gym/etc)
-            # before upsert so DB gets more complete meet records.
-            if args.meet:
-                print("  Metadata enrichment skipped for targeted meet")
-            elif ENABLE_TARGET_METADATA_ENRICHMENT:
-                try:
-                    target_states = sorted(
-                        {str(m.get("state")).upper() for m in meets_to_process if m.get("state")}
-                    ) or args.states
-                    discovered = discover_meets(states=target_states)
-                    meets_to_process = _merge_missing_meet_metadata(meets_to_process, discovered)
-                    print(f"  Metadata enrichment: merged from {len(discovered)} discovered meets")
-                except Exception as exc:
-                    print(f"  Metadata enrichment skipped: {exc}")
-            else:
-                print("  Metadata enrichment: disabled (ENABLE_TARGET_METADATA_ENRICHMENT=0)")
         else:
             print(f"  Mode: Auto-discovery from MSO")
             print(f"  States: {', '.join(args.states)}")
@@ -1086,7 +926,6 @@ def _run_ingest_core(args) -> tuple[int, int]:
                 except Exception:
                     fp = None
 
-                skip_due_to_no_change = False
                 if fp:
                     db = SessionLocal()
                     try:
@@ -1107,33 +946,17 @@ def _run_ingest_core(args) -> tuple[int, int]:
                                 db.flush()
 
                             if state.last_fingerprint == fp:
-                                # Only skip unchanged fingerprints when this meet already has scores.
-                                # If no scores exist yet, keep scraping to avoid "stuck at zero rows".
-                                existing_score = (
-                                    db.query(Score.id)
-                                    .filter(Score.meet_id == meet_row.id)
-                                    .first()
-                                )
                                 state.last_polled_at = now
                                 db.commit()
-                                if existing_score:
-                                    print(f"      [{i+1}] {name} - no change detected, skipping")
-                                    skip_due_to_no_change = True
-                                else:
-                                    print(
-                                        f"      [{i+1}] {name} - fingerprint unchanged but no saved scores yet; retrying scrape"
-                                    )
-                            else:
-                                # New fingerprint seen; mark poll time now.
-                                # We promote last_fingerprint after a non-empty scrape below.
-                                state.last_polled_at = now
-                                db.commit()
-                                skip_due_to_no_change = False
+                                print(f"      [{i+1}] {name} - no change detected, skipping")
+                                continue
+
+                            state.last_fingerprint = fp
+                            state.last_polled_at = now
+                            state.last_changed_at = now
+                            db.commit()
                     finally:
                         db.close()
-
-                if skip_due_to_no_change:
-                    continue
 
                 # Try the API scraper only when explicitly enabled; otherwise go straight to HTML.
                 raw_rows = scrape_mso_meet_api(mso_url) if MSO_API_ENABLED else []
@@ -1245,32 +1068,6 @@ def _run_ingest_core(args) -> tuple[int, int]:
                     print(
                         f"            → saved: {saved} new score records  |  skipped: {dupes} dupes"
                     )
-
-                    # Promote fingerprint only after we actually scraped non-empty data.
-                    if fp:
-                        db = SessionLocal()
-                        try:
-                            meet_row = db.query(Meet).filter(Meet.meet_id == meet["meet_id"]).first()
-                            if meet_row:
-                                state = (
-                                    db.query(IngestSourceState)
-                                    .filter(
-                                        IngestSourceState.meet_id == meet_row.id,
-                                        IngestSourceState.source == "mso_results",
-                                    )
-                                    .first()
-                                )
-                                if not state:
-                                    state = IngestSourceState(meet_id=meet_row.id, source="mso_results")
-                                    db.add(state)
-                                    db.flush()
-                                now = datetime.utcnow()
-                                state.last_fingerprint = fp
-                                state.last_polled_at = now
-                                state.last_changed_at = now
-                                db.commit()
-                        finally:
-                            db.close()
                 else:
                     print(f"            → no rows found (meet may not have results yet)")
 

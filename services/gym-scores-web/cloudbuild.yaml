@@ -1,0 +1,20 @@
+# Build gym-scores-web with NEXT_PUBLIC_API_URL baked in (required for Next.js client bundle).
+# Run from repo root: gcloud builds submit services/gym-scores-web --config services/gym-scores-web/cloudbuild.yaml
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--no-cache"
+      - "--build-arg"
+      - "NEXT_PUBLIC_API_URL=${_NEXT_PUBLIC_API_URL}"
+      - "--tag"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/gym-scores-web:latest"
+      - "."
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/gym-scores-web:latest"
+substitutions:
+  _NEXT_PUBLIC_API_URL: "https://gym-scores-api-617613197143.us-central1.run.app"
+options:
+  logging: CLOUD_LOGGING_ONLY
