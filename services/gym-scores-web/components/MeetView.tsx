@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { fetchScores, fetchMeets, fetchMeetSessions, fetchMeetAthletes } from "@/lib/api";
 import type { ScoreRow, ScoresResponse, EventKey, MeetInfo, MeetSummary, MeetSessionSummary } from "@/lib/types";
 import { EVENTS } from "@/lib/types";
+import { computePerEventRanks, scoreRowKey } from "@/lib/eventRanks";
 import { ScoreCard } from "./ScoreCard";
 
 /** Default meet (2026 Indiana Optional State); override with NEXT_PUBLIC_DEFAULT_MEET_KEY if needed. */
@@ -11,6 +12,8 @@ const DEFAULT_MEET_KEY = process.env.NEXT_PUBLIC_DEFAULT_MEET_KEY ?? "MSO-36541"
 /** Shown in the meet dropdown if this meet is not in the API list yet (e.g. before ingest upsert). */
 const DEFAULT_MEET_LABEL = "2026 Indiana Optional State Championships";
 const REFRESH_INTERVAL_MS = 60_000;
+const LS_DISMISS_ABOUT_RESULTS = "gym-scores-dismiss-about-results";
+const LS_DISMISS_NO_SCORES_HINT = "gym-scores-dismiss-no-scores-hint";
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -128,6 +131,8 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
   const [isIos, setIsIos] = useState(false);
   const [isStandalone, setIsStandalone] = useState(false);
   const [hideInstallHint, setHideInstallHint] = useState(false);
+  const [showAboutResultsNotice, setShowAboutResultsNotice] = useState(true);
+  const [showNoScoresHint, setShowNoScoresHint] = useState(true);
 
   const load = useCallback(async () => {
     setError(null);
@@ -151,6 +156,13 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
     setIsIos(ios);
     setIsStandalone(standalone);
     setHideInstallHint(previouslyInstalled || standalone);
+
+    if (window.localStorage.getItem(LS_DISMISS_ABOUT_RESULTS) === "1") {
+      setShowAboutResultsNotice(false);
+    }
+    if (window.localStorage.getItem(LS_DISMISS_NO_SCORES_HINT) === "1") {
+      setShowNoScoresHint(false);
+    }
 
     if ("serviceWorker" in nav) {
       if (process.env.NODE_ENV === "production") {
@@ -186,6 +198,24 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
       window.removeEventListener("beforeinstallprompt", onBeforeInstallPrompt);
       window.removeEventListener("appinstalled", onInstalled);
     };
+  }, []);
+
+  const dismissAboutResultsNotice = useCallback(() => {
+    setShowAboutResultsNotice(false);
+    try {
+      window.localStorage.setItem(LS_DISMISS_ABOUT_RESULTS, "1");
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const dismissNoScoresHint = useCallback(() => {
+    setShowNoScoresHint(false);
+    try {
+      window.localStorage.setItem(LS_DISMISS_NO_SCORES_HINT, "1");
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   const onInstallClick = useCallback(async () => {
@@ -330,9 +360,13 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
         ]
       : ["All"];
   const sorted = data ? sortByEvent(data.rows, event) : [];
+  const eventRanksByRow = useMemo(() => {
+    if (!data?.rows?.length) return new Map<string, Partial<Record<EventKey, number>>>();
+    return computePerEventRanks(data.rows);
+  }, [data?.rows]);
   const selectedMeetInList = meets.some((m) => m.meet_id === activeMeetKey);
   const showNoScoresYet =
-    Boolean(data && !error && !loading && data.rows.length === 0);
+    Boolean(data && !error && !loading && data.rows.length === 0 && showNoScoresHint);
 
   return (
     <div className="mx-auto max-w-lg px-4 pb-12 pt-6">
@@ -440,12 +474,26 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
             </div>
           </label>
         </div>
-        <p className="mb-1 text-[11px] leading-snug text-slate-500">
-          <span className="font-semibold text-slate-600">About results: </span>
-          Scores from <strong>public sources</strong> are entered and updated <strong>by the meet director</strong>, on
-          their own timeline. This app only reflects what appears there after we pull data—timing and completeness are{" "}
-          <strong>not controlled by us</strong>.
-        </p>
+        {showAboutResultsNotice && (
+          <div className="relative mb-1 rounded-lg border border-slate-200 bg-slate-50 py-2 pl-2.5 pr-9 text-[11px] leading-snug text-slate-500">
+            <button
+              type="button"
+              onClick={() => dismissAboutResultsNotice()}
+              className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/80 hover:text-slate-800"
+              aria-label="Dismiss scoring notice"
+            >
+              <span className="text-lg leading-none" aria-hidden="true">
+                ×
+              </span>
+            </button>
+            <p>
+              <span className="font-semibold text-slate-600">About results: </span>
+              Scores from <strong>public sources</strong> are entered and updated <strong>by the meet director</strong>,
+              on their own timeline. This app only reflects what appears there after we pull data—timing and
+              completeness are <strong>not controlled by us</strong>.
+            </p>
+          </div>
+        )}
         <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-2 text-xs font-medium text-slate-700">
           <label className="col-span-1 flex items-center gap-1.5">
             <span>Session</span>
@@ -642,9 +690,19 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
 
       {showNoScoresYet && (
         <div
-          className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950"
+          className="relative mt-4 rounded-xl border border-amber-200 bg-amber-50 py-3 pl-4 pr-10 text-sm text-amber-950"
           role="status"
         >
+          <button
+            type="button"
+            onClick={() => dismissNoScoresHint()}
+            className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center rounded-full text-amber-900/70 hover:bg-amber-200/60 hover:text-amber-950"
+            aria-label="Dismiss no scores message"
+          >
+            <span className="text-xl leading-none" aria-hidden="true">
+              ×
+            </span>
+          </button>
           <p className="font-semibold">No scores yet for this meet</p>
           <p className="mt-1 text-amber-900/90">
             Nothing is in our database for this meet yet—often because the director hasn&apos;t published scores to{" "}
@@ -671,7 +729,13 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
                   String(i),
                 ].join("|")}
               >
-                <ScoreCard row={row} event={event} rank={i + 1} showPastResults={showPastResults} />
+                <ScoreCard
+                  row={row}
+                  event={event}
+                  rank={i + 1}
+                  showPastResults={showPastResults}
+                  eventRanks={eventRanksByRow.get(scoreRowKey(row))}
+                />
               </li>
             ))}
           </ul>

@@ -6,15 +6,13 @@ import type { EventKey } from "@/lib/types";
 function fmtScore(x: number | null): string {
   return x == null ? "—" : x.toFixed(3);
 }
-function fmtPlace(p: number | null): string {
-  return p == null ? "" : `#${p}`;
-}
-
 interface ScoreCardProps {
   row: ScoreRow;
   event: EventKey;
   rank: number;
   showPastResults: boolean;
+  /** When API `place` is null (e.g. live), ranks by score within the loaded/filtered set. */
+  eventRanks?: Partial<Record<EventKey, number>>;
 }
 
 function ordinal(p: number): string {
@@ -29,16 +27,20 @@ function placeLabel(p: number | null): string {
   return ordinal(p);
 }
 
-export function ScoreCard({ row, event, rank, showPastResults }: ScoreCardProps) {
+/** Show standing: 1st/2nd/3rd or #n (official place from feed, or computed rank for live). */
+function formatStanding(p: number | null): string {
+  if (p == null) return "";
+  if (p <= 3) return placeLabel(p);
+  return `#${p}`;
+}
+
+export function ScoreCard({ row, event, rank, showPastResults, eventRanks }: ScoreCardProps) {
   const e = row[event];
-  const rankBadgeClass =
-    rank === 1
-      ? "bg-gradient-to-b from-amber-300 to-amber-500 text-amber-950 ring-1 ring-amber-200"
-      : rank === 2
-      ? "bg-gradient-to-b from-slate-100 to-slate-300 text-slate-900 ring-1 ring-slate-300"
-      : rank === 3
-      ? "bg-gradient-to-b from-orange-300 to-orange-500 text-orange-950 ring-1 ring-orange-200"
-      : "bg-red-600 text-white";
+  const rankBadgeClass = "border border-slate-200 bg-slate-100 text-slate-700";
+
+  const mainOfficialPlace = e.place;
+  const mainStanding =
+    mainOfficialPlace ?? (e.score != null ? rank : null);
 
   return (
     <div className="rounded-2xl border border-slate-200/80 bg-white p-3 shadow-sm">
@@ -68,20 +70,23 @@ export function ScoreCard({ row, event, rank, showPastResults }: ScoreCardProps)
         <div className="shrink-0 text-right">
           <div className="font-bold text-slate-900">{fmtScore(e.score)}</div>
           <div className="text-xs font-semibold text-slate-500">
-            {showPastResults ? fmtPlace(e.place) : ""}
+            {mainStanding != null ? formatStanding(mainStanding) : null}
           </div>
         </div>
       </div>
       <div className="mt-2 flex gap-1 rounded-xl border border-slate-100 bg-slate-50/50 p-1.5">
         {(["vt", "ub", "bb", "fx", "aa"] as const).map((ev) => (
           (() => {
-            const place = row[ev].place;
+            const officialPlace = row[ev].place;
+            const computedPlace =
+              row[ev].score != null ? eventRanks?.[ev] ?? null : null;
+            const displayPlace = officialPlace ?? computedPlace;
             const medalPillClass =
-              showPastResults && place === 1
+              showPastResults && officialPlace === 1
                 ? "bg-gradient-to-b from-amber-100 to-amber-200 text-amber-900 border border-amber-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.55)]"
-                : showPastResults && place === 2
+                : showPastResults && officialPlace === 2
                 ? "bg-gradient-to-b from-slate-100 to-slate-300 text-slate-900 border border-slate-400 shadow-[inset_0_1px_0_rgba(255,255,255,0.6)]"
-                : showPastResults && place === 3
+                : showPastResults && officialPlace === 3
                 ? "bg-gradient-to-b from-orange-100 to-orange-300 text-orange-900 border border-orange-300 shadow-[inset_0_1px_0_rgba(255,255,255,0.55)]"
                 : "";
             const className =
@@ -97,9 +102,9 @@ export function ScoreCard({ row, event, rank, showPastResults }: ScoreCardProps)
           >
             <div className="uppercase">{ev === "aa" ? "AA" : ev}</div>
             <div className="text-slate-700">{fmtScore(row[ev].score)}</div>
-            {showPastResults && place != null && (
+            {displayPlace != null && (
               <div className="mt-0.5 text-[10px] font-extrabold">
-                {place <= 3 ? placeLabel(place) : `#${place}`}
+                {formatStanding(displayPlace)}
               </div>
             )}
           </div>
