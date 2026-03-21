@@ -365,6 +365,10 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
     return computePerEventRanks(data.rows);
   }, [data?.rows]);
   const selectedMeetInList = meets.some((m) => m.meet_id === activeMeetKey);
+  const defaultMeetInApiList = meets.some((m) => m.meet_id === DEFAULT_MEET_KEY);
+  /** If the configured default is not in `/api/meets`, keep it selectable after switching away (synthetic row only exists while that meet is selected). */
+  const showDefaultMeetOption =
+    !defaultMeetInApiList && (activeMeetKey !== DEFAULT_MEET_KEY || selectedMeetInList);
   const showNoScoresYet =
     Boolean(data && !error && !loading && data.rows.length === 0 && showNoScoresHint);
 
@@ -384,17 +388,17 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
               </p>
             )}
           </div>
-          <span
-            className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold ${
-              status.tone === "live"
-                ? "bg-red-500 text-white"
-                : status.tone === "upcoming"
-                ? "bg-amber-400 text-black"
-                : "bg-white/15 text-white"
-            }`}
-          >
-            {status.label}
-          </span>
+          {status.tone !== "past" && (
+            <span
+              className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold ${
+                status.tone === "live"
+                  ? "bg-red-500 text-white"
+                  : "bg-amber-400 text-black"
+              }`}
+            >
+              {status.label}
+            </span>
+          )}
         </div>
       </header>
 
@@ -449,6 +453,11 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
                 {!selectedMeetInList && (
                   <option value={activeMeetKey}>
                     {meetInfo?.name || meetName || (activeMeetKey === DEFAULT_MEET_KEY ? DEFAULT_MEET_LABEL : null) || activeMeetKey}
+                  </option>
+                )}
+                {showDefaultMeetOption && (
+                  <option value={DEFAULT_MEET_KEY}>
+                    {DEFAULT_MEET_LABEL}
                   </option>
                 )}
                 {meets.map((m) => (
