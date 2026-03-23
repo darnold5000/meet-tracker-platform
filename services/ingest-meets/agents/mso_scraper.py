@@ -13,12 +13,47 @@ import os
 import time
 from datetime import datetime
 from typing import Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 import hashlib
 from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
 MSO_BASE = "https://www.meetscoresonline.com"
+
+
+def canonical_mso_url(url: str) -> str:
+    """
+    MSO shows different session-picker UIs for apex vs www (same meet path).
+    Always use https://www.meetscoresonline.com so fingerprint + scrape match manual testing.
+    """
+    if not url or not isinstance(url, str):
+        return url
+    u = url.strip()
+    if not u:
+        return u
+    try:
+        parsed = urlparse(u)
+    except Exception:
+        return u
+    host = (parsed.netloc or "").lower().split(":")[0]
+    if host in ("meetscoresonline.com", "www.meetscoresonline.com"):
+        out = urlunparse(
+            (
+                "https",
+                "www.meetscoresonline.com",
+                parsed.path or "",
+                "",
+                parsed.query or "",
+                parsed.fragment or "",
+            )
+        )
+        if out != u:
+            logger.info("Normalized MSO URL for consistent host: %s -> %s", u, out)
+        return out
+    return u
+
+
 PAGE_LOAD_TIMEOUT = 20000
 DEFAULT_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 PLAYWRIGHT_HEADLESS = os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() in {
@@ -47,12 +82,36 @@ MSO_MOBILE_EMULATION = os.getenv("MSO_MOBILE_EMULATION", "0").strip().lower() in
     "on",
 }
 
+# Prepended to the final fingerprint digest input. Bump default (or set env) when the
+# fingerprint recipe changes (canonical host, session sync, table capture, etc.) so
+# existing DB last_fingerprint values are treated as stale and one full scrape runs.
+MSO_FINGERPRINT_SCHEMA_VERSION = (
+    os.getenv("MSO_FINGERPRINT_SCHEMA_VERSION", "2").strip() or "2"
+)
+
 
 def get_playwright_context_kwargs() -> Dict:
     """Build Playwright context config for normal desktop scraping."""
     # Even if MSO_MOBILE_EMULATION is set, we keep the scraper in its
     # original desktop mode for lightweight ingest.
     return {"user_agent": DEFAULT_UA}
+
+
+def get_chromium_launch_kwargs() -> Dict:
+    """
+    Chromium launch options for Linux containers (Cloud Run, etc.).
+
+    Headless shell + SwiftShader has been observed to SIGSEGV on some hosts.
+    Prefer full Chromium via Dockerfile env ``PLAYWRIGHT_CHROMIUM_USE_HEADLESS_SHELL=0``.
+    """
+    args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-setuid-sandbox",
+    ]
+    return {"headless": PLAYWRIGHT_HEADLESS, "args": args}
 
 
 def _harden_playwright_context(context) -> None:
@@ -232,6 +291,7 @@ def scrape_mso_meet_with_context(context, mso_url: str) -> List[Dict]:
     Returns:
         List of unique raw score dicts ready for DB insertion
     """
+    mso_url = canonical_mso_url(mso_url)
     logger.info("Scraping MSO meet: %s", mso_url)
     rows: List[Dict] = []
     meet_id = _extract_meet_id_from_url(mso_url)
@@ -276,7 +336,7 @@ def scrape_mso_meet(mso_url: str) -> List[Dict]:
         return []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(**get_chromium_launch_kwargs())
         context = browser.new_context(**get_playwright_context_kwargs())
         try:
             return scrape_mso_meet_with_context(context, mso_url)
@@ -289,14 +349,16 @@ def fingerprint_mso_results_page_with_context(context, mso_url: str) -> Optional
     Compute a lightweight fingerprint for an MSO results page using an existing
     Playwright context (so callers can reuse the same browser for scrape+fingerprint).
     """
+    mso_url = canonical_mso_url(mso_url)
     meet_id = _extract_meet_id_from_url(mso_url)
 
     def _fingerprint_one(url: str) -> str:
         from bs4 import BeautifulSoup
 
         page = context.new_page()
-        # Fingerprinting should be cheap; avoid waiting for full network idle.
-        page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="domcontentloaded")
+        # Must match _scrape_result_page: domcontentloaded often captures the shell before scores
+        # render, producing a stable hash → "no change detected" forever after one good run.
+        page.goto(url, timeout=PAGE_LOAD_TIMEOUT, wait_until="networkidle")
         _dismiss_overlay(page)
 
         try:
@@ -307,21 +369,30 @@ def fingerprint_mso_results_page_with_context(context, mso_url: str) -> Optional
         except Exception:
             pass
 
-        # Align fingerprinting with scraping: for date-based meets, select today's date item
-        # so we don't treat changes on past days as "changed".
-        if MSO_ONLY_TODAY_SESSIONS:
-            try:
-                _dismiss_overlay(page)
-                _open_session_dropdown(page, timeout_ms=2500)
-                page.wait_for_timeout(300)
-                picker_items = page.query_selector_all(".session-picker-item")
-                item_texts = []
-                for item in picker_items:
-                    try:
-                        item_texts.append((item.inner_text() or "").strip())
-                    except Exception:
-                        item_texts.append("")
+        # Snapshot all session-picker labels into the fingerprint. Otherwise when Session 02
+        # appears in the menu but its table is still an empty shell, the table hash matches
+        # Session 01 and ingest wrongly skips ("no change detected") for an hour+.
+        picker_sig = ""
+        picker_items = []
+        item_texts: list[str] = []
+        try:
+            _dismiss_overlay(page)
+            _open_session_dropdown(page, timeout_ms=2500)
+            page.wait_for_timeout(300)
+            picker_items = page.query_selector_all(".session-picker-item")
+            for item in picker_items:
+                try:
+                    item_texts.append((item.inner_text() or "").strip())
+                except Exception:
+                    item_texts.append("")
+            picker_sig = "\u241e".join(item_texts)
+        except Exception:
+            pass
 
+        # Align fingerprinting with scraping: for date-based meets, select today's session row
+        # so we don't treat changes on past days as "changed".
+        if MSO_ONLY_TODAY_SESSIONS and picker_items:
+            try:
                 today_mdy = _today_in_mso_tz()
                 has_any_dates = any(_extract_mdy(t) for t in item_texts)
                 if has_any_dates:
@@ -341,8 +412,13 @@ def fingerprint_mso_results_page_with_context(context, mso_url: str) -> Optional
                     except Exception:
                         _dismiss_overlay(page)
                         page.evaluate("el => el.click()", picker_items[chosen])
-                    page.wait_for_timeout(600)
+                    page.wait_for_timeout(2500)
+                    try:
+                        page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception:
+                        pass
                     _dismiss_overlay(page)
+                    _sync_nav_session_after_picker_click(page, item_texts[chosen])
             except Exception:
                 pass
 
@@ -356,14 +432,15 @@ def fingerprint_mso_results_page_with_context(context, mso_url: str) -> Optional
         else:
             payload = soup.get_text(" ", strip=True)
 
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        composite = f"session-picker:{picker_sig}\n{payload}"
+        return hashlib.sha256(composite.encode("utf-8")).hexdigest()
 
     result_urls = _result_urls_for_mso(context, mso_url)
     parts: List[str] = []
     for url in result_urls:
         parts.append(_fingerprint_one(url))
 
-    combined = f"{meet_id}|" + "|".join(parts)
+    combined = f"{MSO_FINGERPRINT_SCHEMA_VERSION}|{meet_id}|" + "|".join(parts)
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
 
@@ -377,6 +454,7 @@ def fingerprint_mso_results_page(mso_url: str) -> Optional[str]:
     Returns:
         sha256 hex digest string, or None if fingerprinting fails.
     """
+    mso_url = canonical_mso_url(mso_url)
     logger.info("Fingerprinting MSO results: %s", mso_url)
 
     try:
@@ -387,7 +465,7 @@ def fingerprint_mso_results_page(mso_url: str) -> Optional[str]:
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(**get_chromium_launch_kwargs())
             context = browser.new_context(**get_playwright_context_kwargs())
             try:
                 return fingerprint_mso_results_page_with_context(context, mso_url)
@@ -435,6 +513,117 @@ def _open_session_dropdown(page, timeout_ms: int = 5000) -> None:
     )
 
 
+def _session_num_from_picker_label(text: str) -> Optional[int]:
+    """
+    MSO flyout rows often look like '01 - Level 6 (Jr A-D) 3:00 PM'.
+    Date rows ('Today (Sat) 3/21/2026') return None.
+    """
+    if not text:
+        return None
+    s = text.strip()
+    m = re.match(r"^\s*0*(\d+)\s*-\s*", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _read_nav_session_number(page) -> Optional[int]:
+    """Session shown in the breadcrumb / session control (e.g. 'Session 01')."""
+    try:
+        btn = page.query_selector("a.session.btn")
+        if not btn:
+            return None
+        t = (btn.inner_text() or "") + " " + (btn.text_content() or "")
+        m = re.search(r"Session\s*0*(\d+)", t, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _click_breadcrumb_session_tab(page, session_num: int, timeout_ms: int = 5000) -> bool:
+    """
+    After picking a sub-session from the date flyout, MSO sometimes still shows Session 01
+    until the user clicks the horizontal 'Session 02 (n)' tab. Click that tab if present.
+    """
+    for el in page.query_selector_all('a, [role="tab"], button'):
+        try:
+            cls = (el.get_attribute("class") or "").lower()
+            if "session" in cls and "btn" in cls:
+                continue
+            text = (el.inner_text() or "").strip()
+            if not text:
+                continue
+            m = re.search(r"Session\s*0*(\d+)\s*\(\s*\d+\s*\)", text, re.IGNORECASE)
+            if m and int(m.group(1)) == session_num:
+                _dismiss_overlay(page)
+                el.click(timeout=timeout_ms)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _retry_picker_click_session_line(page, session_num: int, timeout_ms: int = 5000) -> bool:
+    """Re-open the session/date dropdown and click the 'NN - ...' line for that session."""
+    prefix_re = re.compile(rf"^\s*0*{session_num}\s*-\s*", re.IGNORECASE)
+    try:
+        _dismiss_overlay(page)
+        _open_session_dropdown(page, timeout_ms=timeout_ms)
+        page.wait_for_timeout(900)
+        for item in page.query_selector_all(".session-picker-item"):
+            try:
+                t = (item.inner_text() or "").strip()
+                if prefix_re.match(t):
+                    _dismiss_overlay(page)
+                    try:
+                        item.click(timeout=timeout_ms)
+                    except Exception:
+                        page.evaluate("el => el.click()", item)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _sync_nav_session_after_picker_click(page, picker_item_text: str) -> None:
+    """
+    If the flyout selected '02 - ...' but the nav still reads Session 01, click the matching tab.
+    """
+    want = _session_num_from_picker_label(picker_item_text)
+    if want is None:
+        return
+    _dismiss_overlay(page)
+    page.wait_for_timeout(500)
+    have = _read_nav_session_number(page)
+    if have == want:
+        return
+    logger.info(
+        "MSO nav shows Session %s after picker click for %r; fixing to Session %s",
+        have,
+        picker_item_text[:80],
+        want,
+    )
+    fixed = False
+    if _click_breadcrumb_session_tab(page, want):
+        fixed = True
+    elif _retry_picker_click_session_line(page, want):
+        fixed = True
+    if fixed:
+        page.wait_for_timeout(2000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except Exception:
+            pass
+        _dismiss_overlay(page)
+
+
 def _resolve_result_urls(context, slug_url: str) -> List[str]:
     """
     Open the meet event page and collect links to /Results/<id> sub-pages.
@@ -459,7 +648,7 @@ def _resolve_result_urls(context, slug_url: str) -> List[str]:
             m = re.search(r"/Results/(\d+)", link)
             if m and m.group(1) not in seen:
                 seen.add(m.group(1))
-                result_urls.append(f"{MSO_BASE}/Results/{m.group(1)}")
+                result_urls.append(canonical_mso_url(f"{MSO_BASE}/Results/{m.group(1)}"))
 
         return result_urls
 
@@ -539,6 +728,8 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
         except Exception:
             pass
 
+        # MSO roughly uses two UI families: (1) Combined + optional Session 01/02 tabs,
+        # (2) date headers + flyout rows "01 - Level …". Try Combined first, then fall back.
         # Strategy 1: Try "Combined" first (works when sessions are simple A01, B02, etc.)
         combined_rows = []
         try:
@@ -669,6 +860,7 @@ def _scrape_result_page(context, result_url: str, meet_id: str) -> List[Dict]:
                         except Exception:
                             pass
                         _dismiss_overlay(page)
+                        _sync_nav_session_after_picker_click(page, text)
                         item_rows = collect_rows(page)
                         if item_rows:
                             logger.info("  Session picker item %d (%s): %d rows", i + 1, text[:50], len(item_rows))

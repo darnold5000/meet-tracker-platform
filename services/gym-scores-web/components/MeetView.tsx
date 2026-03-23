@@ -1,19 +1,28 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { fetchScores, fetchMeets, fetchMeetSessions, fetchMeetAthletes } from "@/lib/api";
 import type { ScoreRow, ScoresResponse, EventKey, MeetInfo, MeetSummary, MeetSessionSummary } from "@/lib/types";
 import { EVENTS } from "@/lib/types";
 import { computePerEventRanks, scoreRowKey } from "@/lib/eventRanks";
+import { openTallyFeedback, TALLY_FEEDBACK_FORM_ID } from "@/lib/feedback";
 import { ScoreCard } from "./ScoreCard";
 
 /** Default meet (2026 Indiana Optional State); override with NEXT_PUBLIC_DEFAULT_MEET_KEY if needed. */
 const DEFAULT_MEET_KEY = process.env.NEXT_PUBLIC_DEFAULT_MEET_KEY ?? "MSO-36541";
 /** Shown in the meet dropdown if this meet is not in the API list yet (e.g. before ingest upsert). */
 const DEFAULT_MEET_LABEL = "2026 Indiana Optional State Championships";
+/** Postal/state code for the default meet; used to show the synthetic row when State = All or matches this (e.g. All → KY → IN). */
+const DEFAULT_MEET_STATE = (process.env.NEXT_PUBLIC_DEFAULT_MEET_STATE ?? "IN").trim() || "IN";
 const REFRESH_INTERVAL_MS = 60_000;
 const LS_DISMISS_ABOUT_RESULTS = "gym-scores-dismiss-about-results";
 const LS_DISMISS_NO_SCORES_HINT = "gym-scores-dismiss-no-scores-hint";
+/** “About results” banner — off for now; set true to show again (still respects dismiss in localStorage). */
+const SHOW_ABOUT_RESULTS_NOTICE = false;
+
+function feedbackHelpfulDismissStorageKey(meetKey: string) {
+  return `gym-scores-feedback-helpful-dismissed-${meetKey}`;
+}
 
 interface BeforeInstallPromptEvent extends Event {
   prompt: () => Promise<void>;
@@ -117,6 +126,8 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [meets, setMeets] = useState<MeetSummary[]>([]);
+  const [meetStateFilter, setMeetStateFilter] = useState("All");
+  const [meetStatesForPicker, setMeetStatesForPicker] = useState<string[]>([]);
   const [activeMeetKey, setActiveMeetKey] = useState(meetKey);
   const [sessions, setSessions] = useState<MeetSessionSummary[]>([]);
   const [sessionId, setSessionId] = useState("All");
@@ -131,18 +142,43 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
   const [isIos, setIsIos] = useState(false);
   const [isStandalone, setIsStandalone] = useState(false);
   const [hideInstallHint, setHideInstallHint] = useState(false);
-  const [showAboutResultsNotice, setShowAboutResultsNotice] = useState(true);
+  const [showAboutResultsNotice, setShowAboutResultsNotice] = useState(SHOW_ABOUT_RESULTS_NOTICE);
+  const [contextualFeedbackDismissed, setContextualFeedbackDismissed] = useState(false);
   const [showNoScoresHint, setShowNoScoresHint] = useState(true);
+  /** Unfiltered score rows for building Level / Division / Gym dropdowns (filtered `data.rows` would collapse options). */
+  const [filterOptionsByMeet, setFilterOptionsByMeet] = useState<{
+    meetKey: string;
+    rows: ScoreRow[];
+  } | null>(null);
+
+  /** When switching meets, reset filters in layout so the scores fetch effect never runs with the previous meet's session/level/etc. */
+  useLayoutEffect(() => {
+    setSessionId("All");
+    setLevel("All");
+    setDivision("All");
+    setGym("All");
+    setAthlete("All");
+    // Drop stale scores immediately so header/body never show the previous meet while the new request is in flight.
+    setData(null);
+    setError(null);
+    setLoading(true);
+  }, [activeMeetKey]);
+
+  const scoresFetchGenRef = useRef(0);
+  const meetsListFetchGenRef = useRef(0);
 
   const load = useCallback(async () => {
     setError(null);
+    const gen = ++scoresFetchGenRef.current;
     try {
       const res = await fetchScores(activeMeetKey, { level, division, gym, session: sessionId, athlete, limit: 500 });
+      if (gen !== scoresFetchGenRef.current) return;
       setData(res);
     } catch (e) {
+      if (gen !== scoresFetchGenRef.current) return;
       setError(e instanceof Error ? e.message : "Failed to load scores");
     } finally {
-      setLoading(false);
+      if (gen === scoresFetchGenRef.current) setLoading(false);
     }
   }, [activeMeetKey, level, division, gym, sessionId, athlete]);
 
@@ -157,13 +193,15 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
     setIsStandalone(standalone);
     setHideInstallHint(previouslyInstalled || standalone);
 
-    if (window.localStorage.getItem(LS_DISMISS_ABOUT_RESULTS) === "1") {
+    if (
+      SHOW_ABOUT_RESULTS_NOTICE &&
+      window.localStorage.getItem(LS_DISMISS_ABOUT_RESULTS) === "1"
+    ) {
       setShowAboutResultsNotice(false);
     }
     if (window.localStorage.getItem(LS_DISMISS_NO_SCORES_HINT) === "1") {
       setShowNoScoresHint(false);
     }
-
     if ("serviceWorker" in nav) {
       if (process.env.NODE_ENV === "production") {
         void nav.serviceWorker.register("/sw.js");
@@ -200,6 +238,16 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
     };
   }, []);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const k = feedbackHelpfulDismissStorageKey(activeMeetKey);
+      setContextualFeedbackDismissed(window.localStorage.getItem(k) === "1");
+    } catch {
+      setContextualFeedbackDismissed(false);
+    }
+  }, [activeMeetKey]);
+
   const dismissAboutResultsNotice = useCallback(() => {
     setShowAboutResultsNotice(false);
     try {
@@ -208,6 +256,15 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
       /* ignore */
     }
   }, []);
+
+  const dismissContextualFeedbackHelpful = useCallback(() => {
+    try {
+      window.localStorage.setItem(feedbackHelpfulDismissStorageKey(activeMeetKey), "1");
+    } catch {
+      /* ignore */
+    }
+    setContextualFeedbackDismissed(true);
+  }, [activeMeetKey]);
 
   const dismissNoScoresHint = useCallback(() => {
     setShowNoScoresHint(false);
@@ -295,28 +352,49 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
   }, [autoRefresh, canAutoRefresh, load]);
 
   useEffect(() => {
+    const gen = ++meetsListFetchGenRef.current;
     (async () => {
       try {
-        const list = await fetchMeets();
-        setMeets(list);
-        // Keep the configured default meet even if it is not in the API list yet (run ingest to upsert).
-        if (
-          list.length &&
-          !list.some((m) => m.meet_id === activeMeetKey) &&
-          activeMeetKey !== DEFAULT_MEET_KEY
-        ) {
-          setActiveMeetKey(list[0].meet_id);
-        }
+        const { meets: list, states } = await fetchMeets({
+          state: meetStateFilter,
+        });
+        if (gen !== meetsListFetchGenRef.current) return;
+        const stateKey = meetStateFilter.trim().toLowerCase();
+        const normalized =
+          meetStateFilter === "All"
+            ? list
+            : list.filter((m) => (m.state ?? "").trim().toLowerCase() === stateKey);
+        setMeets(normalized);
+        setMeetStatesForPicker(states);
+        setActiveMeetKey((current) => {
+          const filterSt = meetStateFilter.trim().toLowerCase();
+          const defaultSt = DEFAULT_MEET_STATE.toLowerCase();
+          const stateFilterMatchesDefault = filterSt === defaultSt;
+
+          if (!normalized.length) {
+            if (meetStateFilter !== "All" && stateFilterMatchesDefault) return DEFAULT_MEET_KEY;
+            return current;
+          }
+          if (normalized.some((m) => m.meet_id === current)) return current;
+          if (current === DEFAULT_MEET_KEY) {
+            if (meetStateFilter === "All") return current;
+            if (stateFilterMatchesDefault) return current;
+          }
+          // Landing on the default meet’s state (e.g. KY → IN): pick Indiana Optionals, not the first row from the API sort.
+          if (stateFilterMatchesDefault) return DEFAULT_MEET_KEY;
+          return normalized[0].meet_id;
+        });
       } catch {
-        // ignore meet list errors in UI
+        if (gen !== meetsListFetchGenRef.current) return;
+        setMeets([]);
+        setMeetStatesForPicker([]);
       }
     })();
-  }, [activeMeetKey]);
+  }, [meetStateFilter]);
 
   useEffect(() => {
     (async () => {
       setSessions([]);
-      setSessionId("All");
       try {
         const list = await fetchMeetSessions(activeMeetKey);
         setSessions(list);
@@ -338,37 +416,98 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
     })();
   }, [activeMeetKey, level, division, gym, sessionId]);
 
-  const levels = data
-    ? ["All", ...sortLevelOptions(data.rows.map((r) => r.level).filter(Boolean) as string[]).filter((l) => l !== "All")]
-    : ["All"];
-  const divisions = data
+  useEffect(() => {
+    const key = activeMeetKey;
+    setFilterOptionsByMeet(null);
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetchScores(key, { limit: 500 });
+        if (!cancelled) setFilterOptionsByMeet({ meetKey: key, rows: res.rows });
+      } catch {
+        if (!cancelled) setFilterOptionsByMeet({ meetKey: key, rows: [] });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeMeetKey]);
+
+  const allScoreFiltersClear =
+    level === "All" &&
+    division === "All" &&
+    gym === "All" &&
+    sessionId === "All" &&
+    athlete === "All";
+
+  const rowsForFilterDropdowns = useMemo(() => {
+    if (filterOptionsByMeet?.meetKey === activeMeetKey) return filterOptionsByMeet.rows;
+    // Avoid using filtered `data.rows` for options (it collapses choices); only safe when no filters yet.
+    if (allScoreFiltersClear && data?.meet_key === activeMeetKey) return data.rows;
+    return [];
+  }, [
+    activeMeetKey,
+    allScoreFiltersClear,
+    data?.meet_key,
+    data?.rows,
+    filterOptionsByMeet,
+  ]);
+
+  const hasFilterOptionRows = rowsForFilterDropdowns.length > 0;
+  /** Avoid duplicate "All" sentinel vs data values (fixes React duplicate key warnings on <option>). */
+  const notSentinelAll = (s: string) => s.trim().toLowerCase() !== "all";
+
+  const levels = hasFilterOptionRows
     ? [
         "All",
-        ...[...new Set(data.rows.map((r) => r.division).filter(Boolean))]
-          .map((v) => v.trim())
-          .filter(Boolean)
-          .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })),
+        ...sortLevelOptions(rowsForFilterDropdowns.map((r) => r.level).filter(Boolean) as string[]).filter(notSentinelAll),
       ]
     : ["All"];
+  const divisions = hasFilterOptionRows
+    ? (() => {
+        const rest = [...new Set(rowsForFilterDropdowns.map((r) => r.division).filter(Boolean))]
+          .map((v) => v.trim())
+          .filter(Boolean)
+          .filter(notSentinelAll)
+          .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+        return ["All", ...rest];
+      })()
+    : ["All"];
   const gyms =
-    data && data.rows.some((r) => r.gym)
-      ? [
-          "All",
-          ...[...new Set(data.rows.map((r) => r.gym).map((g) => g.trim()).filter(Boolean))].sort((a, b) =>
-            a.localeCompare(b, undefined, { sensitivity: "base" }),
-          ),
-        ]
+    rowsForFilterDropdowns.some((r) => r.gym)
+      ? (() => {
+          const rest = [...new Set(rowsForFilterDropdowns.map((r) => r.gym).map((g) => g.trim()).filter(Boolean))]
+            .filter(notSentinelAll)
+            .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+          return ["All", ...rest];
+        })()
       : ["All"];
   const sorted = data ? sortByEvent(data.rows, event) : [];
   const eventRanksByRow = useMemo(() => {
     if (!data?.rows?.length) return new Map<string, Partial<Record<EventKey, number>>>();
     return computePerEventRanks(data.rows);
   }, [data?.rows]);
-  const selectedMeetInList = meets.some((m) => m.meet_id === activeMeetKey);
-  const defaultMeetInApiList = meets.some((m) => m.meet_id === DEFAULT_MEET_KEY);
-  /** If the configured default is not in `/api/meets`, keep it selectable after switching away (synthetic row only exists while that meet is selected). */
-  const showDefaultMeetOption =
-    !defaultMeetInApiList && (activeMeetKey !== DEFAULT_MEET_KEY || selectedMeetInList);
+  /** API list plus synthetic default when `/api/meets` omits it and the state filter is All or matches the default meet’s state (e.g. IN). */
+  const meetPickerOptions = useMemo((): MeetSummary[] => {
+    if (meets.some((m) => m.meet_id === DEFAULT_MEET_KEY)) return meets;
+    const filterSt = meetStateFilter.trim().toLowerCase();
+    const showSynthetic =
+      meetStateFilter === "All" || filterSt === DEFAULT_MEET_STATE.toLowerCase();
+    if (!showSynthetic) return meets;
+    const synthetic: MeetSummary = {
+      meet_id: DEFAULT_MEET_KEY,
+      name: DEFAULT_MEET_LABEL,
+      location: null,
+      facility: null,
+      host_gym: null,
+      state: DEFAULT_MEET_STATE,
+      start_date: null,
+      end_date: null,
+    };
+    return [synthetic, ...meets];
+  }, [meets, meetStateFilter]);
+
+  const selectedMeetInList = meetPickerOptions.some((m) => m.meet_id === activeMeetKey);
   const showNoScoresYet =
     Boolean(data && !error && !loading && data.rows.length === 0 && showNoScoresHint);
 
@@ -441,26 +580,21 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
             )}
           </div>
         )}
-        <div className="mb-2 flex items-center justify-between gap-2">
-          <label className="flex flex-1 items-center gap-2 text-xs font-medium text-slate-700">
-            <span className="whitespace-nowrap">Meet</span>
+        <div className="mb-2 flex items-end gap-2">
+          <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs font-medium text-slate-700">
+            <span>Meet</span>
             <div className="relative w-full">
               <select
                 value={activeMeetKey}
                 onChange={(e) => setActiveMeetKey(e.target.value)}
-                className="w-full appearance-none rounded-full border border-slate-300 bg-white px-3 py-1.5 pr-8 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-400"
+                className="w-full appearance-none rounded-full border border-slate-300 bg-white px-3 py-2 pr-8 text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-400"
               >
                 {!selectedMeetInList && (
                   <option value={activeMeetKey}>
                     {meetInfo?.name || meetName || (activeMeetKey === DEFAULT_MEET_KEY ? DEFAULT_MEET_LABEL : null) || activeMeetKey}
                   </option>
                 )}
-                {showDefaultMeetOption && (
-                  <option value={DEFAULT_MEET_KEY}>
-                    {DEFAULT_MEET_LABEL}
-                  </option>
-                )}
-                {meets.map((m) => (
+                {meetPickerOptions.map((m) => (
                   <option key={m.meet_id} value={m.meet_id}>
                     {m.name || m.meet_id}
                   </option>
@@ -469,6 +603,40 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
               <svg
                 aria-hidden="true"
                 className="pointer-events-none absolute right-3 top-1/2 h-3 w-3 -translate-y-1/2 text-slate-500"
+                viewBox="0 0 20 20"
+                fill="none"
+              >
+                <path
+                  d="M6 8l4 4 4-4"
+                  stroke="currentColor"
+                  strokeWidth="1.7"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+              </svg>
+            </div>
+          </label>
+          <label className="flex w-[5.25rem] shrink-0 flex-col gap-1 text-xs font-medium text-slate-700 sm:w-24">
+            <span>State</span>
+            <div className="relative w-full">
+              <select
+                value={meetStateFilter}
+                onChange={(e) => setMeetStateFilter(e.target.value)}
+                className="w-full appearance-none rounded-full border border-slate-300 bg-white px-2 py-2 pr-6 text-[11px] font-medium text-slate-800 focus:outline-none focus:ring-2 focus:ring-red-400"
+                title="Filter meets by state, or All states"
+              >
+                <option value="All">All states</option>
+                {[...new Set(meetStatesForPicker)]
+                  .filter((s) => s.trim().toLowerCase() !== "all")
+                  .map((s) => (
+                    <option key={s} value={s}>
+                      {s}
+                    </option>
+                  ))}
+              </select>
+              <svg
+                aria-hidden="true"
+                className="pointer-events-none absolute right-2 top-1/2 h-2.5 w-2.5 -translate-y-1/2 text-slate-500"
                 viewBox="0 0 20 20"
                 fill="none"
               >
@@ -718,11 +886,54 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
             <strong>public sources</strong> yet, or our sync hasn&apos;t run. Even when public listings show names or
             &quot;in progress,&quot; full scores appear only when the meet staff post them.
           </p>
+          {TALLY_FEEDBACK_FORM_ID ? (
+            <p className="mt-3 text-xs text-amber-900/85">
+              💬 Expecting scores here or something look wrong? Tap{" "}
+              <button
+                type="button"
+                onClick={() => openTallyFeedback()}
+                className="font-semibold text-amber-950 underline decoration-amber-600/50 underline-offset-2 hover:text-amber-900"
+              >
+                Feedback
+              </button>
+              .
+            </p>
+          ) : null}
         </div>
       )}
 
       {data && (
         <>
+          {!showNoScoresYet &&
+            TALLY_FEEDBACK_FORM_ID &&
+            !contextualFeedbackDismissed &&
+            data.rows.length > 0 &&
+            !loading &&
+            !error && (
+              <div className="relative mt-2 rounded-lg border border-slate-200 bg-slate-50 py-2 pl-2.5 pr-9 text-[11px] leading-snug text-slate-600">
+                <button
+                  type="button"
+                  onClick={() => dismissContextualFeedbackHelpful()}
+                  className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/80 hover:text-slate-800"
+                  aria-label="Dismiss"
+                >
+                  <span className="text-lg leading-none" aria-hidden="true">
+                    ×
+                  </span>
+                </button>
+                <p>
+                  💬 Was this helpful? Tap{" "}
+                  <button
+                    type="button"
+                    onClick={() => openTallyFeedback()}
+                    className="font-semibold text-red-700 underline decoration-red-300 underline-offset-2 hover:text-red-800"
+                  >
+                    Feedback
+                  </button>{" "}
+                  (bottom right) — takes under a minute.
+                </p>
+              </div>
+            )}
           {!showNoScoresYet && (
             <p className="mt-2 text-sm font-semibold text-slate-500">{data.count} athletes</p>
           )}
@@ -750,6 +961,18 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
           </ul>
         </>
       )}
+
+      {TALLY_FEEDBACK_FORM_ID ? (
+        <button
+          type="button"
+          onClick={() => openTallyFeedback()}
+          title="Quick feedback — about a minute"
+          className="fixed bottom-5 right-4 z-50 rounded-full border border-slate-200 bg-white px-4 py-2.5 text-xs font-semibold text-slate-800 shadow-lg ring-1 ring-black/5 hover:bg-slate-50 focus:outline-none focus:ring-2 focus:ring-red-400"
+          aria-label="Open feedback form (about a minute)"
+        >
+          💬 Feedback
+        </button>
+      ) : null}
     </div>
   );
 }

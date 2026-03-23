@@ -142,3 +142,13 @@ class IngestSourceState(Base):
         UniqueConstraint("meet_id", "source", name="uq_ingest_source_state_meet_source"),
         Index("ix_ingest_source_state_meet_source", "meet_id", "source"),
     )
+
+
+class IngestSetting(Base):
+    """Key/value flags for ingest behavior (toggle without redeploying Cloud Run args)."""
+
+    __tablename__ = "ingest_settings"
+
+    key = Column(String(64), primary_key=True)
+    value = Column(Text)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

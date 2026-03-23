@@ -1,4 +1,4 @@
-import type { ScoresResponse, MeetSummary, MeetSessionSummary } from "./types";
+import type { ScoresResponse, MeetSummary, MeetsListResponse, MeetSessionSummary } from "./types";
 
 const getBaseUrl = () => {
   const url = process.env.NEXT_PUBLIC_API_URL;
@@ -37,15 +37,18 @@ export async function fetchScores(
   return res.json();
 }
 
-export async function fetchMeets(): Promise<MeetSummary[]> {
+export async function fetchMeets(params: { state?: string } = {}): Promise<MeetsListResponse> {
   const base = getBaseUrl();
-  const res = await fetch(`${base}/api/meets`, { next: { revalidate: 0 } });
+  const search = new URLSearchParams();
+  if (params.state && params.state !== "All") search.set("state", params.state);
+  const q = search.toString();
+  const res = await fetch(`${base}/api/meets${q ? `?${q}` : ""}`, { next: { revalidate: 0 } });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error((err as { detail?: string }).detail ?? "Failed to fetch meets");
   }
-  const body = (await res.json()) as { meets?: MeetSummary[] };
-  return body.meets ?? [];
+  const body = (await res.json()) as MeetsListResponse;
+  return { meets: body.meets ?? [], states: body.states ?? [] };
 }
 
 export async function fetchMeetSessions(meetKey: string): Promise<MeetSessionSummary[]> {

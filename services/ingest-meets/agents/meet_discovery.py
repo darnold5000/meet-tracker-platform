@@ -9,7 +9,7 @@ Finds upcoming gymnastics meets from:
 
 import logging
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Dict, Optional
 import requests
 from bs4 import BeautifulSoup
@@ -22,6 +22,9 @@ REQUEST_TIMEOUT = 30
 
 # Target states for focused discovery
 TARGET_STATES = ["IN", "OH", "MI", "CA"]
+
+# When HTML has a start date but no explicit end, match ingest.py: end = start + 3 calendar days.
+_DEFAULT_MEET_END_OFFSET_DAYS = 3
 
 
 def discover_meets(states: List[str] = None) -> List[Dict]:
@@ -332,11 +335,12 @@ def _extract_meet_metadata(link) -> tuple:
                 )
             )
             try:
-                start_date = datetime.strptime(full_matches[0].group(), "%b %d, %Y").date().isoformat()
+                start_d = datetime.strptime(full_matches[0].group(), "%b %d, %Y").date()
+                start_date = start_d.isoformat()
                 if len(full_matches) > 1:
                     end_date = datetime.strptime(full_matches[1].group(), "%b %d, %Y").date().isoformat()
                 else:
-                    end_date = start_date
+                    end_date = (start_d + timedelta(days=_DEFAULT_MEET_END_OFFSET_DAYS)).isoformat()
             except (ValueError, IndexError):
                 pass
 
@@ -368,6 +372,13 @@ def _extract_meet_metadata(link) -> tuple:
             break
         parent = parent.parent
 
+    if start_date and end_date is None:
+        try:
+            sd = datetime.fromisoformat(start_date).date()
+            end_date = (sd + timedelta(days=_DEFAULT_MEET_END_OFFSET_DAYS)).isoformat()
+        except (ValueError, TypeError):
+            pass
+
     return start_date, end_date, location, facility, host_gym
 
 
@@ -385,6 +396,8 @@ def build_meet_dict(
     website_url: Optional[str] = None,
 ) -> Dict:
     """Helper to build a normalized meet dict."""
+    if start_date is not None and end_date is None:
+        end_date = start_date + timedelta(days=_DEFAULT_MEET_END_OFFSET_DAYS)
     return {
         "meet_id": meet_id,
         "name": name,

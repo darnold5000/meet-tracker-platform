@@ -23,6 +23,8 @@ from typing import Dict, List, Optional
 import requests
 import json
 
+from .mso_scraper import canonical_mso_url, get_chromium_launch_kwargs
+
 logger = logging.getLogger(__name__)
 
 MSO_BASE = "https://www.meetscoresonline.com"
@@ -160,7 +162,7 @@ def _fetch_scores_from_page_network(meet_id: str) -> List[Dict]:
             pass
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(**get_chromium_launch_kwargs())
         context = browser.new_context(**_context_kwargs())
         page = context.new_page()
         page.on("response", _maybe_capture)
@@ -261,6 +263,7 @@ def scrape_mso_meet_api(mso_url: str) -> List[Dict]:
     Returns:
         List of raw score dicts with placement data
     """
+    mso_url = canonical_mso_url(mso_url)
     logger.info("Scraping MSO meet via API: %s", mso_url)
 
     meet_id = _extract_meet_id_from_url(mso_url)
@@ -326,7 +329,7 @@ def _get_sessions_for_meet(meet_id: str) -> List[Optional[str]]:
         meet_url = f"{MSO_BASE}/Results/{meet_id}"
         
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(**get_chromium_launch_kwargs())
             context = browser.new_context(**_context_kwargs())
             page = context.new_page()
             page.goto(meet_url, timeout=30000, wait_until="networkidle")
@@ -577,7 +580,7 @@ def _fetch_scores_from_api(meet_id: str, session: Optional[str] = None) -> List[
         logger.debug("Using Playwright to fetch API for meet %s, session %s", meet_id, session or "ALL")
         
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(**get_chromium_launch_kwargs())
             context = browser.new_context(**_context_kwargs())
             page = context.new_page()
             

@@ -41,6 +41,12 @@ export interface MeetSummary {
   end_date: string | null;
 }
 
+/** GET /api/meets — meets may be filtered by `state` query; `states` is always all distinct states in the qualifying set. */
+export interface MeetsListResponse {
+  meets: MeetSummary[];
+  states: string[];
+}
+
 export interface MeetSessionSummary {
   session_id: string;
   label: string;

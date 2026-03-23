@@ -8,13 +8,14 @@ Two modes:
 
 Usage:
     # Auto-discovery mode (default) - scrapes first N meets
-    .venv/bin/python ingest.py [--states IN OH MI CA] [--scrape-limit 5]
+    .venv/bin/python ingest.py --disc [--states IN OH MI CA] [--scrape-limit 5]  # discover meets from MSO
     
     # Interactive mode - shows all meets and lets you select which to scrape
     .venv/bin/python ingest.py --interactive [--states IN OH MI CA]
     
-    # Use hardcoded TARGET_MEETS array
+    # Use hardcoded TARGET_MEETS array (no MSO listing requests unless --disc)
     .venv/bin/python ingest.py --use-target-meets [--scrape-limit 5]
+    .venv/bin/python ingest.py --use-target-meets --disc   # merge metadata from MSO state/search listings
     
     # Interactive selection from TARGET_MEETS
     .venv/bin/python ingest.py --use-target-meets --interactive
@@ -29,7 +30,7 @@ import logging
 import os
 import sys
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 from sqlalchemy.exc import IntegrityError
 
@@ -46,9 +47,61 @@ logger = logging.getLogger("ingest")
 
 # MSO "API" frequently returns HTML; default to skipping it in live polling.
 MSO_API_ENABLED = os.getenv("MSO_API_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"}
-ENABLE_TARGET_METADATA_ENRICHMENT = os.getenv("ENABLE_TARGET_METADATA_ENRICHMENT", "1").strip().lower() in {
-    "1", "true", "yes", "on"
+# When true, do not use MSO page fingerprint to skip scrapes (always run full scrape).
+MSO_DISABLE_RESULT_FINGERPRINT = os.getenv("MSO_DISABLE_RESULT_FINGERPRINT", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
 }
+# If >0, run a full scrape anyway when the fingerprint matches but last_changed_at is older than
+# this many minutes (live meets: scores can change without invalidating a flaky fingerprint).
+def _fingerprint_force_scrape_minutes() -> int:
+    raw = os.getenv("MSO_FINGERPRINT_FORCE_SCRAPE_MINUTES", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+# When true (default), do not fingerprint-skip if today's calendar date (MSO_TZ) falls within
+# the meet's start_date..end_date in the DB — full scrape every run on competition days.
+MSO_ALWAYS_SCRAPE_ON_MEET_DAYS = os.getenv("MSO_ALWAYS_SCRAPE_ON_MEET_DAYS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+
+def _mso_tz_name() -> str:
+    return os.getenv("MSO_TZ", "America/New_York").strip() or "America/New_York"
+
+
+def _calendar_today_mso_tz():
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.now(ZoneInfo(_mso_tz_name())).date()
+    except Exception:
+        return datetime.utcnow().date()
+
+
+def _is_within_meet_date_window(start, end) -> bool:
+    if start is None:
+        return False
+    today = _calendar_today_mso_tz()
+    last = end if end is not None else start
+    return start <= today <= last
+
+
+# Optional: enable target-list metadata merge without CLI --disc (default off; prefer --disc).
+ENABLE_TARGET_METADATA_ENRICHMENT = os.getenv("ENABLE_TARGET_METADATA_ENRICHMENT", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
+# DB row `ingest_settings.key` — truthy values: 1, true, yes, on (toggle without changing Cloud Run args).
+INGEST_SETTING_DISCOVER_MSO_LISTINGS = "discover_mso_listings"
 
 # ---------------------------------------------------------------------------
 # CLI args
@@ -58,8 +111,12 @@ parser = argparse.ArgumentParser(description="Run meet ingest for target meets")
 parser.add_argument(
     "--scrape-limit",
     type=int,
-    default=5,
-    help="Max meets to attempt score scraping on (default: 5)",
+    default=1,
+    help=(
+        "Stop after this many meets that return at least one score row (after dedup). "
+        "Meets with no URL, fingerprint skip, errors, or 0 rows do not count. "
+        "Not applied with --meet or --interactive (default: 5)"
+    ),
 )
 parser.add_argument(
     "--meet",
@@ -77,12 +134,21 @@ parser.add_argument(
     type=str,
     nargs="+",
     default=["IN", "OH", "MI", "CA"],
-    help="State codes for meet discovery (default: IN OH MI CA). Only used when --use-target-meets is not set.",
+    help="State codes for meet discovery (default: IN OH MI CA). Used with --disc (and without --use-target-meets), or as fallback states for --disc + --use-target-meets.",
 )
 parser.add_argument(
     "--interactive",
     action="store_true",
     help="Show interactive menu to select which meets to scrape",
+)
+parser.add_argument(
+    "--disc",
+    action="store_true",
+    help=(
+        "Run MSO meet discovery (HTTP listing pages). With --use-target-meets: merge dates/location "
+        "into TARGET_MEETS before save. Without --use-target-meets: build meet list from discovery "
+        "(required in that mode)."
+    ),
 )
 args = parser.parse_args()
 
@@ -93,7 +159,9 @@ args = parser.parse_args()
 from agents.mso_api_scraper import scrape_mso_meet_api
 from agents.mso_scraper import (
     DEFAULT_UA,
+    canonical_mso_url,
     fingerprint_mso_results_page_with_context,
+    get_chromium_launch_kwargs,
     scrape_mso_meet,
     scrape_mso_meet_with_context,
 )
@@ -101,7 +169,7 @@ from agents.meet_discovery import discover_meets
 from core.normalizer import normalize_mso_record, normalize_mso_api_record
 from core.gym_normalizer import normalize_gym_name as normalize_gym_name_canonical
 from db.database import SessionLocal, create_tables, engine
-from db.models import Meet, Athlete, AthleteAlias, Score, Gym, IngestSourceState, Session
+from db.models import Meet, Athlete, AthleteAlias, Score, Gym, IngestSourceState, Session, IngestSetting
 import hashlib
 
 # ---------------------------------------------------------------------------
@@ -114,27 +182,22 @@ import hashlib
 TARGET_MEETS = [
     # Each entry is upserted to the DB when using --use-target-meets (step 1) before scraping scores.
     # --- Already discovered / in DB ---
-    {
-        "meet_id": "MSO-36541",
-        "name": "2026 Indiana Optional State Championships",
-        "mso_url": "https://meetscoresonline.com/Results/36541",
-        "source": "mso", "state": "IN",
-        "start_date": "2026-03-20", "location": "Bloomington, IN",
-    },
     # {
     #     "meet_id": "MSO-35799",
     #     "name": "2026 Jaycie Phelps Midwest Showdown",
     #     "mso_url": "https://www.meetscoresonline.com/R35799",
     #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-01-23", "location": "French Lick, IN",
+    #     "start_date": "2026-01-23",
+    #     "end_date": "2026-01-25",
+    #     "location": "French Lick, IN",
     # },
-    # {
-    #     "meet_id": "MSO-35397",
-    #     "name": "2025 North Pole Classic USAG",
-    #     "mso_url": "https://www.meetscoresonline.com/R35397",
-    #     "source": "file", "state": "IN",
-    #     "start_date": "2025-12-12", "location": "Indianapolis, IN",
-    # },
+    {
+        "meet_id": "MSO-35397",
+        "name": "2025 North Pole Classic USAG",
+        "mso_url": "https://www.meetscoresonline.com/R35397",
+        "source": "file", "state": "IN",
+        "start_date": "2025-12-12", "location": "Indianapolis, IN",
+    },
     # {
     #     "meet_id": "MSO-35120",
     #     "name": "2026 California Grand Invitational",
@@ -142,13 +205,13 @@ TARGET_MEETS = [
     #     "source": "mso", "state": "CA",
     #     "start_date": "2026-01-09", "location": "Anaheim, CA",
     # },
-    # {
-    #     "meet_id": "MSO-35846",
-    #     "name": "2026 Jaycie Phelps Midwest Showdown NGA",
-    #     "mso_url": "https://www.meetscoresonline.com/R35846",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-01-23", "location": "French Lick, IN",
-    # },
+    {
+        "meet_id": "MSO-35846",
+        "name": "2026 Jaycie Phelps Midwest Showdown NGA",
+        "mso_url": "https://www.meetscoresonline.com/R35846",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-01-23", "location": "French Lick, IN",
+    },
     # {
     #     "meet_id": "MSO-35550",
     #     "name": "2026 Circle of Stars",
@@ -170,20 +233,20 @@ TARGET_MEETS = [
     #     "source": "mso", "state": "IN",
     #     "start_date": "2026-02-20", "location": "Westfield, IN",
     # },
-    # {
-    #     "meet_id": "MSO-36190",
-    #     "name": "2026 Flip For Your Cause [NGA]",
-    #     "mso_url": "https://www.meetscoresonline.com/R36190",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-02-20", "location": "Westfield, IN",
-    # },
-    # {
-    #     "meet_id": "MSO-36315",
-    #     "name": "2026 Shamrock Shenanigans At Midwest",
-    #     "mso_url": "https://www.meetscoresonline.com/R36315",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-02-27", "location": "Dyer, IN",
-    # },
+    {
+        "meet_id": "MSO-36190",
+        "name": "2026 Flip For Your Cause [NGA]",
+        "mso_url": "https://www.meetscoresonline.com/R36190",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-02-20", "location": "Westfield, IN",
+    },
+    {
+        "meet_id": "MSO-36315",
+        "name": "2026 Shamrock Shenanigans At Midwest",
+        "mso_url": "https://www.meetscoresonline.com/R36315",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-02-27", "location": "Dyer, IN",
+    },
     # --- Need to find / verify MSO IDs ---
     # {
     #     "meet_id": "MSO-BUG-BITE-2025",
@@ -214,21 +277,34 @@ TARGET_MEETS = [
     #     "source": "file", "state": "OH",
     #     "start_date": "2026-02-27", "location": "Hamilton, OH",
     # },
-    #  {
-    #     "meet_id": "MSO-36478",
-    #     "name": "2026 IN Compulsory State Championships",
-    #     "mso_url": "https://www.meetscoresonline.com/Results/36478",
-    #     # "mso_url": "https://www.meetscoresonline.com/2026-IN-Compulsory-State-Championships",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-03-13", "location": "Crown Pointe, IN",
-    # }
-    # {
-    #     "meet_id": "MSO-36489",
-    #     "name": "2026 I AM Classic Meet",
-    #     "mso_url": "https://www.meetscoresonline.com/R36489",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-03-13", "location": "Plymouth, IN",
-    # },
+    {
+        "meet_id": "MSO-36478",
+        "name": "2026 IN Compulsory State Championships",
+        "mso_url": "https://www.meetscoresonline.com/Results/36478",
+        # "mso_url": "https://www.meetscoresonline.com/2026-IN-Compulsory-State-Championships",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-03-13",
+        "end_date": "2026-03-15",
+        "location": "Crown Pointe, IN",
+    },
+    {
+        "meet_id": "MSO-36489",
+        "name": "2026 I AM Classic Meet",
+        "mso_url": "https://www.meetscoresonline.com/R36489",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-03-13",
+        "end_date": "2026-03-14",
+        "location": "Plymouth, IN",
+    },
+    {
+        "meet_id": "MSO-36541",
+        "name": "2026 Indiana Optional State Championships",
+        "mso_url": "https://meetscoresonline.com/Results/36541",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-03-20",
+        "end_date": "2026-03-22",
+        "location": "Bloomington, IN",
+    },
     # {
     #     "meet_id": "MSO-36105",
     #     "name": "Money Madness 2026 - NGA",
@@ -257,13 +333,13 @@ TARGET_MEETS = [
     #     "source": "mso", "state": "IN",
     #     "start_date": "2026-01-16", "location": "Indianapolis, IN",
     # },
-    # {
-    #     "meet_id": "MSO-35610",
-    #     "name": "2026 Wabash Valley Classic Meet NGA",
-    #     "mso_url": "https://www.meetscoresonline.com/R35610",
-    #     "source": "mso", "state": "IN",
-    #     "start_date": "2026-01-09", "location": "Terre Haute, IN",
-    # },
+    {
+        "meet_id": "MSO-35610",
+        "name": "2026 Wabash Valley Classic Meet NGA",
+        "mso_url": "https://www.meetscoresonline.com/R35610",
+        "source": "mso", "state": "IN",
+        "start_date": "2026-01-09", "location": "Terre Haute, IN",
+    },
     # {
     #     "meet_id": "MSO-35628",
     #     "name": "2026 Wabash Valley Classic Meet USAG",
@@ -319,7 +395,8 @@ def save_meets(meets: list) -> tuple:
                 existing.facility = m.get("facility") or existing.facility
                 existing.host_gym = m.get("host_gym") or existing.host_gym
                 existing.state = m.get("state") or existing.state
-                existing.mso_url = m.get("mso_url") or existing.mso_url
+                if m.get("mso_url"):
+                    existing.mso_url = canonical_mso_url(str(m.get("mso_url")).strip())
                 skipped += 1
                 continue
 
@@ -332,7 +409,11 @@ def save_meets(meets: list) -> tuple:
                 start_date=_parse_date(m.get("start_date")),
                 end_date=_parse_date(m.get("end_date")),
                 host_gym=m.get("host_gym"),
-                mso_url=m.get("mso_url"),
+                mso_url=(
+                    canonical_mso_url(str(m["mso_url"]).strip())
+                    if m.get("mso_url")
+                    else None
+                ),
                 scorecat_url=m.get("scorecat_url"),
                 website_url=m.get("website_url"),
             )
@@ -362,69 +443,53 @@ def _parse_date(value):
 def _calculate_placements_from_scores(normalized_rows: list, meet_id: str) -> list:
     """
     Calculate placements from scores when placement data is missing.
-    Groups by level, division, and event, then ranks by score (higher = better).
-    Only calculates placements for rows where place is None.
-    
-    Args:
-        normalized_rows: List of normalized score dicts
-        meet_id: Meet ID for logging
-        
-    Returns:
-        List of normalized rows with place values calculated
+    Groups by session, level, division, and event, then ranks by score (higher = better).
+    Only fills place for rows where place is None (does not overwrite MSO places).
+    Uses competition ranking for ties (e.g. 1, 1, 3).
     """
-    # Check if any rows are missing place values
     missing_places = sum(1 for row in normalized_rows if row.get("place") is None)
     if missing_places == 0:
         return normalized_rows
-    
+
     logger.info("Calculating placements for %d scores missing place data (meet: %s)", missing_places, meet_id)
-    
-    # Group by level, division, and event for ranking
+
     from collections import defaultdict
+
     groups = defaultdict(list)
-    
     for idx, row in enumerate(normalized_rows):
         key = (
+            str(row.get("session") or ""),
             row.get("level", ""),
             row.get("division", ""),
-            row.get("event", "")
+            row.get("event", ""),
         )
         groups[key].append((idx, row))
-    
-    # Calculate ranks for each group
-    for key, rows_with_idx in groups.items():
-        level, division, event = key
-        
-        # Sort by score descending (higher score = better)
+
+    for _key, rows_with_idx in groups.items():
         sorted_rows = sorted(
             rows_with_idx,
-            key=lambda x: (x[1].get("score") or 0),
-            reverse=True
+            key=lambda x: (x[1].get("score") is None, -(x[1].get("score") or 0), x[1].get("athlete_name") or ""),
         )
-        
-        # Assign places (handle ties - same score = same place)
-        # Place starts at 1, increments when score changes
-        current_place = 1
-        prev_score = None
-        
-        for rank_idx, (orig_idx, row) in enumerate(sorted_rows):
-            score = row.get("score")
-            
-            # Only calculate if place is missing
-            if row.get("place") is None:
-                # If score is different from previous, update place to current rank position
-                if prev_score is not None and score != prev_score:
-                    current_place = rank_idx + 1
-                elif rank_idx == 0:
-                    # First row always gets place 1
-                    current_place = 1
-                
-                normalized_rows[orig_idx]["place"] = current_place
-                prev_score = score
-    
+        i = 0
+        while i < len(sorted_rows):
+            orig_idx, row = sorted_rows[i]
+            sc = row.get("score")
+            if sc is None:
+                i += 1
+                continue
+            j = i + 1
+            while j < len(sorted_rows) and sorted_rows[j][1].get("score") == sc:
+                j += 1
+            rank = i + 1
+            for k in range(i, j):
+                oi, r = sorted_rows[k]
+                if r.get("place") is None:
+                    normalized_rows[oi]["place"] = rank
+            i = j
+
     calculated_count = sum(1 for row in normalized_rows if row.get("place") is not None)
     logger.info("Calculated placements for %d scores", calculated_count)
-    
+
     return normalized_rows
 
 
@@ -729,47 +794,60 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
         if not all_hashes:
             return 0, skipped
 
-        # Bulk check existing hashes (much faster than N queries).
-        existing_hashes: set[str] = set()
-        # De-dupe the IN list to keep the query small.
+        # Load existing score rows by hash so we can UPDATE place when MSO adds it later (same score → same hash).
         unique_hashes = list(set(all_hashes))
-        CHUNK = 900  # safe for most DB parameter limits
+        existing_score_rows: dict[str, Score] = {}
+        CHUNK = 900
         for off in range(0, len(unique_hashes), CHUNK):
             chunk = unique_hashes[off : off + CHUNK]
-            rows = db.query(Score.record_hash).filter(Score.record_hash.in_(chunk)).all()
-            existing_hashes.update(r[0] for r in rows)
+            for sc in db.query(Score).filter(Score.record_hash.in_(chunk)).all():
+                existing_score_rows[sc.record_hash] = sc
 
-        # If everything already exists, short-circuit without gym/athlete lookups.
-        if len(existing_hashes) == len(unique_hashes):
-            return 0, skipped + len(all_hashes)
-
-        # Track record_hashes we've seen in THIS batch to prevent duplicates within the same batch
         seen_hashes_in_batch: set[str] = set()
 
         for plan in planned:
-            # If all events for this athlete row are already present, skip cheaply.
-            if plan["hashes"] and all(h in existing_hashes for h in plan["hashes"]):
-                skipped += len(plan["hashes"])
-                continue
-
-            gym = _get_or_create_gym(db, plan["gym_name"])
-            athlete = _get_or_create_athlete(db, plan["athlete_name"], gym, plan["level"])
-            if not athlete:
-                skipped += len(plan["events"])
-                continue
-
-            session_obj = _get_or_create_session(
-                db,
-                meet_db_id=meet.id,
-                session_key=plan.get("session_key") or "",
-                session_number=plan.get("session_number"),
-                start_time=plan.get("session_start_time"),
-            )
+            gym = None
+            athlete = None
+            session_obj = None
+            abort_plan_inserts = False
 
             for (event_label, score_val, place), record_hash in zip(plan["events"], plan["hashes"]):
-                if record_hash in seen_hashes_in_batch or record_hash in existing_hashes:
+                if record_hash in seen_hashes_in_batch:
                     skipped += 1
                     continue
+
+                existing_row = existing_score_rows.get(record_hash)
+                if existing_row is not None:
+                    seen_hashes_in_batch.add(record_hash)
+                    if place is not None and existing_row.place != place:
+                        existing_row.place = place
+                        inserted += 1
+                    else:
+                        skipped += 1
+                    continue
+
+                if abort_plan_inserts:
+                    skipped += 1
+                    continue
+
+                if gym is None:
+                    gym = _get_or_create_gym(db, plan["gym_name"])
+                if athlete is None:
+                    athlete = _get_or_create_athlete(db, plan["athlete_name"], gym, plan["level"])
+                if not athlete:
+                    abort_plan_inserts = True
+                    skipped += 1
+                    continue
+
+                if session_obj is None:
+                    session_obj = _get_or_create_session(
+                        db,
+                        meet_db_id=meet.id,
+                        session_key=plan.get("session_key") or "",
+                        session_number=plan.get("session_number"),
+                        start_time=plan.get("session_start_time"),
+                    )
+
                 seen_hashes_in_batch.add(record_hash)
 
                 score = Score(
@@ -785,6 +863,7 @@ def save_scores(normalized_rows: list, meet_external_id: str) -> tuple:
                     record_hash=record_hash,
                 )
                 db.add(score)
+                existing_score_rows[record_hash] = score
                 inserted += 1
 
         db.commit()
@@ -859,7 +938,7 @@ def _merge_missing_meet_metadata(base_meets: list[dict], discovered_meets: list[
     """
     by_id = {m.get("meet_id"): m for m in discovered_meets if m.get("meet_id")}
     by_url = {
-        str(m.get("mso_url", "")).strip().lower(): m
+        str(canonical_mso_url(str(m["mso_url"]).strip())).lower(): m
         for m in discovered_meets
         if m.get("mso_url")
     }
@@ -870,7 +949,9 @@ def _merge_missing_meet_metadata(base_meets: list[dict], discovered_meets: list[
         out = dict(m)
         src = by_id.get(out.get("meet_id"))
         if not src and out.get("mso_url"):
-            src = by_url.get(str(out.get("mso_url")).strip().lower())
+            src = by_url.get(
+                str(canonical_mso_url(str(out["mso_url"]).strip())).lower()
+            )
         if src:
             for f in fields:
                 if not out.get(f) and src.get(f):
@@ -958,6 +1039,41 @@ def interactive_meet_selection(meets: list) -> list:
     return selected_meets
 
 
+def _truthy_ingest_setting(value) -> bool:
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _discover_mso_listings_enabled_via_db() -> bool:
+    try:
+        create_tables()
+        db = SessionLocal()
+        try:
+            row = (
+                db.query(IngestSetting)
+                .filter(IngestSetting.key == INGEST_SETTING_DISCOVER_MSO_LISTINGS)
+                .first()
+            )
+            return _truthy_ingest_setting(row.value) if row else False
+        finally:
+            db.close()
+    except Exception as exc:
+        logger.debug("Could not read ingest_settings.%s: %s", INGEST_SETTING_DISCOVER_MSO_LISTINGS, exc)
+        return False
+
+
+def _resolve_discover_mso_listings(args) -> tuple[bool, str]:
+    """Whether to run discover_meets() (MSO listing HTTP). Returns (enabled, source label for logs)."""
+    if getattr(args, "disc", False):
+        return True, "disc"
+    if ENABLE_TARGET_METADATA_ENRICHMENT:
+        return True, "ENABLE_TARGET_METADATA_ENRICHMENT"
+    if _discover_mso_listings_enabled_via_db():
+        return True, f"ingest_settings.{INGEST_SETTING_DISCOVER_MSO_LISTINGS}"
+    return False, "off"
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -993,40 +1109,59 @@ def _run_ingest_core(args) -> tuple[int, int]:
         print(f"\n{'='*60}")
         print(f"  USAG Meet Tracker - Targeted Ingest")
 
+        discover_mso, discover_src = _resolve_discover_mso_listings(args)
+
         # Step 0: Determine meets source
         if args.use_target_meets:
-            print(f"  Mode: Using hardcoded TARGET_MEETS array")
+            print(f"  Mode: TARGET_MEETS (hardcoded list) — score scrape uses Playwright on each meet URL")
             meets_to_process = TARGET_MEETS
-            print(f"  Meets: {len(meets_to_process)} target meets (2025-26 season)")
+            print(f"  Meets: {len(meets_to_process)} entries in TARGET_MEETS")
 
-            # Enrich target meets with discoverable metadata (end_date/facility/host_gym/etc)
-            # before upsert so DB gets more complete meet records.
+            # Optional: HTTP crawl of MSO state/search listing pages (discover_meets), not the results scraper.
             if args.meet:
-                print("  Metadata enrichment skipped for targeted meet")
-            elif ENABLE_TARGET_METADATA_ENRICHMENT:
+                print(
+                    "  MSO listing discovery: skipped (--meet; no index/search crawl, only that meet’s results page)"
+                )
+            elif discover_mso:
+                print(f"  MSO listing discovery: on ({discover_src}) — crawling MSO index/search to enrich metadata")
                 try:
                     target_states = sorted(
                         {str(m.get("state")).upper() for m in meets_to_process if m.get("state")}
                     ) or args.states
                     discovered = discover_meets(states=target_states)
                     meets_to_process = _merge_missing_meet_metadata(meets_to_process, discovered)
-                    print(f"  Metadata enrichment: merged from {len(discovered)} discovered meets")
+                    print(
+                        f"  MSO listing discovery: merged missing fields from {len(discovered)} listing rows "
+                        f"(states: {', '.join(target_states)})"
+                    )
                 except Exception as exc:
-                    print(f"  Metadata enrichment skipped: {exc}")
+                    print(f"  MSO listing discovery: failed ({exc})")
             else:
-                print("  Metadata enrichment: disabled (ENABLE_TARGET_METADATA_ENRICHMENT=0)")
+                print(
+                    "  MSO listing discovery: off — no MSO /Results.All or ?search= HTTP crawl; "
+                    "TARGET_MEETS unchanged before save. Turn on with --disc, ENABLE_TARGET_METADATA_ENRICHMENT=1, "
+                    f"or DB ingest_settings.{INGEST_SETTING_DISCOVER_MSO_LISTINGS}=true"
+                )
         else:
-            print(f"  Mode: Auto-discovery from MSO")
-            print(f"  States: {', '.join(args.states)}")
-            print(f"  Discovering meets...")
+            print(
+                "  Mode: MSO listing discovery only — meet list built from MSO index/search pages (not TARGET_MEETS)"
+            )
+            if not discover_mso:
+                print("  ERROR: This mode needs MSO listing discovery enabled.")
+                print("  Turn on: --disc, ENABLE_TARGET_METADATA_ENRICHMENT=1, or DB")
+                print(f"  ingest_settings key {INGEST_SETTING_DISCOVER_MSO_LISTINGS!r} = true")
+                print("  Or use:  python ingest.py --use-target-meets  (no listing crawl)")
+                print("  Example:  python ingest.py --disc --states IN --scrape-limit 5")
+                return 0, 0
+            print(f"  MSO listing discovery: on ({discover_src}) — states: {', '.join(args.states)}")
             discovered_meets = discover_meets(states=args.states)
             meets_to_process = discovered_meets
-            print(f"  Discovered: {len(discovered_meets)} meets")
+            print(f"  MSO listing discovery: {len(discovered_meets)} meets returned from listing crawl")
 
         print(f"{'='*60}\n")
 
         # Step 1: Upsert all meets
-        print(f"[1/2] Saving meets to database...")
+        print(f"[1/2] Upsert meet rows to database (from TARGET_MEETS or listing crawl above)...")
         try:
             inserted, skipped = save_meets(meets_to_process)
             print(f"      Inserted: {inserted}  |  Already existed: {skipped}\n")
@@ -1049,19 +1184,39 @@ def _run_ingest_core(args) -> tuple[int, int]:
                 print("  No meets selected. Exiting.")
                 return 0, 0
         else:
-            meets_to_scrape = meets_to_process[: args.scrape_limit]
-            print(f"[2/2] Scraping scores (limit: {args.scrape_limit} meets)...")
+            # Full list: we stop after `scrape_limit` meets that return at least one score row
+            # (after dedup). Meets with no MSO URL, fingerprint skip, errors, or 0 rows do not count.
+            meets_to_scrape = meets_to_process
 
-        if not args.meet and not args.interactive:
-            print(f"[2/2] Scraping scores (limit: {args.scrape_limit} meets)...")
+        if args.meet or args.interactive:
+            print(
+                f"[2/2] Results-page scrape (Playwright) for {len(meets_to_scrape)} selected meet(s)..."
+            )
         else:
-            print(f"[2/2] Scraping scores for {len(meets_to_scrape)} selected meet(s)...")
+            print(
+                f"[2/2] Results-page scrape (Playwright), up to {args.scrape_limit} meets **with data**; "
+                f"0-row meets do not count toward the limit..."
+            )
 
         score_rows_total = 0
         score_saved_total = 0
 
-        for i, meet in enumerate(meets_to_scrape):
-            mso_url = meet.get("mso_url")
+        use_success_based_limit = not args.meet and not args.interactive
+        scrape_success_target = args.scrape_limit if use_success_based_limit else None
+        successful_meets_with_rows = 0
+        meet_queue = meets_to_scrape
+        qi = 0
+
+        while qi < len(meet_queue):
+            if (
+                scrape_success_target is not None
+                and successful_meets_with_rows >= scrape_success_target
+            ):
+                break
+            meet = meet_queue[qi]
+            qi += 1
+            i = qi - 1  # 0-based; existing logs use [{i+1}]
+            mso_url = canonical_mso_url((meet.get("mso_url") or "").strip())
             name = meet.get("name", meet["meet_id"])
             if not mso_url:
                 print(f"      [{i+1}] {name} - no MSO URL, skipping")
@@ -1076,15 +1231,33 @@ def _run_ingest_core(args) -> tuple[int, int]:
                 from playwright.sync_api import sync_playwright
 
                 pw = sync_playwright().start()
-                browser = pw.chromium.launch(headless=True)
-                context = browser.new_context(user_agent=DEFAULT_UA)
+                browser = None
+                context = None
+
+                def _new_browser_context() -> None:
+                    nonlocal browser, context
+                    if browser is not None:
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
+                    browser = pw.chromium.launch(**get_chromium_launch_kwargs())
+                    context = browser.new_context(user_agent=DEFAULT_UA)
+
+                _new_browser_context()
 
                 # Cheap change detection: fingerprint the rendered results page.
                 fp = None
-                try:
-                    fp = fingerprint_mso_results_page_with_context(context, mso_url)
-                except Exception:
-                    fp = None
+                if not MSO_DISABLE_RESULT_FINGERPRINT:
+                    try:
+                        fp = fingerprint_mso_results_page_with_context(context, mso_url)
+                    except Exception as exc:
+                        logger.warning(
+                            "MSO fingerprint failed (relaunching browser before scrape): %s",
+                            exc,
+                        )
+                        fp = None
+                        _new_browser_context()
 
                 skip_due_to_no_change = False
                 if fp:
@@ -1116,9 +1289,33 @@ def _run_ingest_core(args) -> tuple[int, int]:
                                 )
                                 state.last_polled_at = now
                                 db.commit()
-                                if existing_score:
-                                    print(f"      [{i+1}] {name} - no change detected, skipping")
-                                    skip_due_to_no_change = True
+                                force_mins = _fingerprint_force_scrape_minutes()
+                                stale = False
+                                if (
+                                    force_mins > 0
+                                    and existing_score
+                                    and state.last_changed_at is not None
+                                ):
+                                    age_sec = (now - state.last_changed_at).total_seconds()
+                                    if age_sec >= force_mins * 60:
+                                        stale = True
+                                if existing_score and not stale:
+                                    if MSO_ALWAYS_SCRAPE_ON_MEET_DAYS and _is_within_meet_date_window(
+                                        meet_row.start_date, meet_row.end_date
+                                    ):
+                                        print(
+                                            f"      [{i+1}] {name} - fingerprint unchanged but today is within "
+                                            f"meet dates ({meet_row.start_date}–{meet_row.end_date or meet_row.start_date}); "
+                                            f"forcing full scrape"
+                                        )
+                                    else:
+                                        print(f"      [{i+1}] {name} - no change detected, skipping")
+                                        skip_due_to_no_change = True
+                                elif existing_score and stale:
+                                    print(
+                                        f"      [{i+1}] {name} - fingerprint unchanged but "
+                                        f"last successful scrape > {force_mins}m ago; forcing full scrape"
+                                    )
                                 else:
                                     print(
                                         f"      [{i+1}] {name} - fingerprint unchanged but no saved scores yet; retrying scrape"
@@ -1246,6 +1443,9 @@ def _run_ingest_core(args) -> tuple[int, int]:
                         f"            → saved: {saved} new score records  |  skipped: {dupes} dupes"
                     )
 
+                    if scrape_success_target is not None:
+                        successful_meets_with_rows += 1
+
                     # Promote fingerprint only after we actually scraped non-empty data.
                     if fp:
                         db = SessionLocal()
@@ -1316,12 +1516,22 @@ def run_ingest(
     states: list[str] | None = None,
     scrape_limit: int = 5,
     interactive: bool = False,
+    disc: bool | None = None,
 ) -> tuple[int, int]:
     """
     Programmatic entrypoint for ingestion (Cloud Run jobs, other apps, tests).
 
+    When meet_id and interactive are both unset, scrape_limit is the number of meets
+    that must return at least one score row (after dedup); 0-row meets are skipped
+    for the count and scanning continues down the list.
+
+    `disc`: if None, defaults to (not use_target_meets) so discovery mode still discovers;
+    set False with use_target_meets to skip MSO listing requests.
+
     Returns (score_rows_total, score_saved_total).
     """
+    if disc is None:
+        disc = not use_target_meets
 
     class _Args:
         def __init__(self) -> None:
@@ -1330,6 +1540,7 @@ def run_ingest(
             self.use_target_meets = use_target_meets
             self.states = states or ["IN", "OH", "MI", "CA"]
             self.interactive = interactive
+            self.disc = disc
 
     return _run_ingest_core(_Args())
 

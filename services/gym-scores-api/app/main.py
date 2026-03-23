@@ -180,14 +180,32 @@ def service_worker():
 
 
 @app.get("/api/meets", response_class=JSONResponse)
-def api_meets():
+def api_meets(
+    state: Optional[str] = Query(
+        None,
+        description="If set, only meets whose `meets.state` matches (case-insensitive). Use All or omit for every state.",
+    ),
+):
     if not ALLOWED_MEET_IDS:
-        return {"meets": []}
+        return {"meets": [], "states": []}
     try:
-        meets = _list_allowed_meets(ALLOWED_MEET_IDS)
+        all_qualifying = _list_allowed_meets_scored_or_upcoming(ALLOWED_MEET_IDS)
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=f"Database not configured: {exc}") from exc
-    return {"meets": meets}
+
+    states = sorted(
+        {str(r["state"]).strip() for r in all_qualifying if r.get("state") and str(r["state"]).strip()},
+        key=lambda s: s.casefold(),
+    )
+
+    want_state = (state or "").strip()
+    if want_state and want_state.casefold() != "all":
+        key = want_state.casefold()
+        meets = [r for r in all_qualifying if (r.get("state") and str(r["state"]).strip().casefold() == key)]
+    else:
+        meets = all_qualifying
+
+    return {"meets": meets, "states": states}
 
 
 @app.get("/api/meet/{meet_key}/sessions", response_class=JSONResponse)
@@ -301,12 +319,12 @@ def _get_meet(meet_key: str) -> dict | None:
     )
 
 
-def _list_allowed_meets(meet_ids: list[str]) -> list[dict]:
+def _list_allowed_meets_scored_or_upcoming(meet_ids: list[str]) -> list[dict]:
+    """Allowlisted meets with scores, or not yet ended (by end_date / start_date) so upcoming / in-progress shows without scores."""
     if not meet_ids:
         return []
-    params = {f"m{i}": mid for i, mid in enumerate(meet_ids)}
+    params: dict[str, Any] = {f"m{i}": mid for i, mid in enumerate(meet_ids)}
     placeholders = ", ".join(f":m{i}" for i in range(len(meet_ids)))
-    # List from `meets` only so new meets appear before any scores are ingested.
     return fetch_all(
         f"""
         SELECT
@@ -320,6 +338,18 @@ def _list_allowed_meets(meet_ids: list[str]) -> list[dict]:
           m.end_date
         FROM meets m
         WHERE m.meet_id IN ({placeholders})
+          AND (
+            EXISTS (SELECT 1 FROM scores s WHERE s.meet_id = m.id)
+            OR (
+              m.end_date IS NOT NULL
+              AND CAST(m.end_date AS DATE) >= CURRENT_DATE
+            )
+            OR (
+              m.end_date IS NULL
+              AND m.start_date IS NOT NULL
+              AND CAST(m.start_date AS DATE) >= CURRENT_DATE
+            )
+          )
         ORDER BY m.start_date DESC NULLS LAST, m.name
         """,
         params,
