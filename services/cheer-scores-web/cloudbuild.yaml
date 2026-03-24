@@ -1,0 +1,20 @@
+# Build cheer-scores-web with NEXT_PUBLIC_API_URL baked in (required for Next.js client bundle).
+# Run from repo root: gcloud builds submit services/cheer-scores-web --config services/cheer-scores-web/cloudbuild.yaml
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--no-cache"
+      - "--build-arg"
+      - "NEXT_PUBLIC_API_URL=${_NEXT_PUBLIC_API_URL}"
+      - "--tag"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/cheer-scores-web:latest"
+      - "."
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/cheer-scores-web:latest"
+substitutions:
+  _NEXT_PUBLIC_API_URL: "https://YOUR-CHEER-SCORES-API.run.app"
+options:
+  logging: CLOUD_LOGGING_ONLY
