@@ -28,5 +28,4 @@ Mirror the gym API: build the `Dockerfile`, push to Artifact Registry, create a 
 
 ## Legacy / tools
 
-- `streamlit_app.py` — optional dashboard; requires `CHEER_SCORES_MEET_KEY`.
 - `scripts/scrape_mso.py` — MSO-oriented helpers carried over from the gym fork; replace with cheer-specific sources when ready.

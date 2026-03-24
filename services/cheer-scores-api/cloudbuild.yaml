@@ -1,0 +1,16 @@
+# Build cheer-scores-api image for Cloud Run.
+# From repo root:
+#   gcloud builds submit services/cheer-scores-api --config services/cheer-scores-api/cloudbuild.yaml
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--tag"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/cheer-scores-api:latest"
+      - "."
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/cheer-scores-api:latest"
+options:
+  logging: CLOUD_LOGGING_ONLY

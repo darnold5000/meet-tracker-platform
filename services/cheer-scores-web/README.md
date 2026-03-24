@@ -26,8 +26,17 @@ The home page is the **MVP**: search, open a meet for **timeline** and **results
 
 Using port **3001** avoids clashing with `gym-scores-web` on **3000**.
 
-## Deploy
+## Deploy (Cloud Run)
 
-1. Set `_NEXT_PUBLIC_API_URL` in `cloudbuild.yaml` to your deployed **cheer** API URL.
-2. `gcloud builds submit services/cheer-scores-web --config services/cheer-scores-web/cloudbuild.yaml`
-3. Map your cheer domain to the new Cloud Run service and add that origin to the API’s `CHEER_SCORES_CORS_ORIGINS`.
+The UI matches **localhost:3001** once the Next image is built with the **real** cheer API URL and CORS is set on the API.
+
+**Order:** deploy **cheer-scores-api** first, then build **cheer-scores-web** with `--substitutions=_NEXT_PUBLIC_API_URL=...`, then deploy the web service. Step-by-step: [`../cheer-scores-api/CLOUD_RUN.md`](../cheer-scores-api/CLOUD_RUN.md).
+
+Short version:
+
+1. Build/push API: `gcloud builds submit services/cheer-scores-api --config services/cheer-scores-api/cloudbuild.yaml`
+2. `gcloud run deploy cheer-scores-api ...` with `DATABASE_URL` secret; note the service URL.
+3. Build/push web with that URL:  
+   `gcloud builds submit services/cheer-scores-web --config services/cheer-scores-web/cloudbuild.yaml --substitutions=_NEXT_PUBLIC_API_URL=https://YOUR-API.run.app`
+4. `gcloud run deploy cheer-scores-web ...`
+5. Set `CHEER_SCORES_CORS_ORIGINS` on the API to your **web** Cloud Run URL (or custom domain).

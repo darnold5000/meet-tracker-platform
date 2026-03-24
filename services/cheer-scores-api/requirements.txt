@@ -11,7 +11,4 @@ playwright
 beautifulsoup4
 lxml
 pandas
-streamlit
-streamlit-autorefresh
-altair==4.2.2
 standard-imghdr
