@@ -2,16 +2,40 @@
 @tailwind components;
 @tailwind utilities;
 
+/* JPAC / Radiance-inspired: cyan, chartreuse, deep teal header */
 :root {
-  --bg: #f4f6f9;
+  --bg: #e8f4fb;
   --card: #ffffff;
-  --text: #0f172a;
-  --muted: #64748b;
-  --brand: #0b2a4a;
-  --accent: #e11d2e;
+  --text: #0a0a0a;
+  --muted: #5a6b78;
+  --brand: #001f2d;
+  --brand-bright: #00adef;
+  --accent: #ccff00;
+  --accent-foreground: #0a0a0a;
+  --gym: #0077aa;
+  --ring: rgba(0, 173, 239, 0.45);
+  --medal-gold-bg: #fef3c7;
+  --medal-gold-text: #78350f;
+  --medal-silver-bg: #e2e8f0;
+  --medal-silver-text: #334155;
+  --medal-bronze-bg: #ffedd5;
+  --medal-bronze-text: #9a3412;
 }
 
 body {
   background: var(--bg);
   color: var(--text);
+}
+
+@layer components {
+  .mvp-select {
+    @apply w-full appearance-none rounded-full border border-slate-300 bg-white px-3 py-2 pr-8 text-xs text-slate-800;
+  }
+  .mvp-select:focus {
+    @apply outline-none;
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+  .mvp-select-sm {
+    @apply px-2 py-2 pr-6 text-[11px] font-medium;
+  }
 }

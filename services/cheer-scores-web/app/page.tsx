@@ -1,9 +1,9 @@
-import { MvpHome } from "@/components/MvpHome";
+import { MvpDashboard } from "@/components/MvpDashboard";
 
 export default function Home() {
   return (
     <main>
-      <MvpHome />
+      <MvpDashboard />
     </main>
   );
 }

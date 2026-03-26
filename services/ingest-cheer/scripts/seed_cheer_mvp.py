@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Create cheer MVP demo data: two competitions (Atlanta + Chicago), teams, sessions, performances."""
+"""Create cheer MVP demo data: two competitions (Atlanta + Chicago), teams, sessions, performances.
+
+Run (from ``services/ingest-cheer``) with ``DATABASE_URL`` set:
+
+  python scripts/seed_cheer_mvp.py              # wipe *all* MVP tables, then seed demo
+  python scripts/seed_cheer_mvp.py --clear-demo # remove only ``source=demo_seed`` meets (keeps Varsity data)
+"""
 
 from __future__ import annotations
 
@@ -26,6 +32,30 @@ def clear_mvp_tables(db: Session) -> None:
     db.execute(text("DELETE FROM cheer_mvp_sessions"))
     db.execute(text("DELETE FROM cheer_mvp_meets"))
     db.execute(text("DELETE FROM cheer_mvp_teams"))
+    db.commit()
+
+
+def clear_demo_only(db: Session) -> None:
+    """Remove seeded demo competitions (source=demo_seed) without touching Varsity-synced rows."""
+    db.execute(
+        text(
+            "DELETE FROM cheer_mvp_performances "
+            "WHERE meet_id IN (SELECT id FROM cheer_mvp_meets WHERE source = 'demo_seed')"
+        )
+    )
+    db.execute(
+        text(
+            "DELETE FROM cheer_mvp_sessions "
+            "WHERE meet_id IN (SELECT id FROM cheer_mvp_meets WHERE source = 'demo_seed')"
+        )
+    )
+    db.execute(text("DELETE FROM cheer_mvp_meets WHERE source = 'demo_seed'"))
+    db.execute(
+        text(
+            "DELETE FROM cheer_mvp_teams AS t "
+            "WHERE NOT EXISTS (SELECT 1 FROM cheer_mvp_performances p WHERE p.team_id = t.id)"
+        )
+    )
     db.commit()
 
 
@@ -130,6 +160,8 @@ def seed_atlanta(db: Session) -> None:
             display_order=0,
             round="Finals",
             final_score=88.16,
+            raw_score=91.20,
+            performance_score=89.05,
             rank=1,
             deductions=0.15,
         ),
@@ -144,6 +176,8 @@ def seed_atlanta(db: Session) -> None:
             display_order=1,
             round="Finals",
             final_score=87.80,
+            raw_score=90.50,
+            performance_score=88.40,
             rank=2,
             deductions=0.30,
         ),
@@ -158,6 +192,8 @@ def seed_atlanta(db: Session) -> None:
             display_order=2,
             round="Finals",
             final_score=86.90,
+            raw_score=89.80,
+            performance_score=87.65,
             rank=3,
             deductions=0.20,
         ),
@@ -249,6 +285,8 @@ def seed_chicago(db: Session) -> None:
             display_order=0,
             round="Finals",
             final_score=91.42,
+            raw_score=94.00,
+            performance_score=92.10,
             rank=1,
             deductions=0.10,
         ),
@@ -263,6 +301,8 @@ def seed_chicago(db: Session) -> None:
             display_order=1,
             round="Finals",
             final_score=90.05,
+            raw_score=92.80,
+            performance_score=91.00,
             rank=2,
             deductions=0.25,
         ),
@@ -277,6 +317,8 @@ def seed_chicago(db: Session) -> None:
             display_order=2,
             round="Finals",
             final_score=89.88,
+            raw_score=92.10,
+            performance_score=90.55,
             rank=3,
             deductions=0.18,
         ),
@@ -285,6 +327,16 @@ def seed_chicago(db: Session) -> None:
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] in ("--clear-demo", "--clear-demo-only"):
+        create_tables()
+        db = SessionLocal()
+        try:
+            clear_demo_only(db)
+            print("Removed cheer_mvp_* rows with source=demo_seed (and teams with no performances).")
+            return 0
+        finally:
+            db.close()
+
     create_tables()
     db = SessionLocal()
     try:

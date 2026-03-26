@@ -2,9 +2,26 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
+import { MVP_DEFAULT_MEET_KEY, MVP_DEFAULT_MEET_LABEL } from "@/lib/mvpDefaults";
+import {
+  dedupeMvpResultRows,
+  dedupeMvpTimelineItems,
+  filterMvpResultsByRoundTab,
+  mvpResultIsFinalsRound,
+  type MvpResultsRoundTab,
+} from "@/lib/mvpDedupe";
 import { mvpResults, mvpTimeline } from "@/lib/mvpApi";
+import {
+  formatMvpMeetDateRangeReadable,
+  getMvpMeetScheduleStatus,
+  mvpMeetHeaderNameLine,
+  mvpMeetPickerLabel,
+  mvpMeetShowsTimelineTab,
+  mvpMeetSummaryToHit,
+} from "@/lib/mvpMeetDisplay";
 import type { MvpResultRow, MvpTimelineItem, MvpTimelineResponse } from "@/lib/mvpTypes";
 import { pushMvpRecent } from "@/lib/mvpRecents";
+import { MvpResultScoreBreakdown } from "@/components/MvpResultScoreBreakdown";
 
 function formatTime(iso: string | null | undefined): string {
   if (!iso) return "—";
@@ -16,10 +33,15 @@ function formatTime(iso: string | null | undefined): string {
   }
 }
 
-function statusTone(status: string): { label: string; className: string } {
+function statusTone(
+  status: string,
+  finalScore: number | null | undefined
+): { label: string; className: string } {
   const s = status.toLowerCase();
-  if (s === "live") return { label: "LIVE", className: "bg-red-500 text-white" };
-  if (s === "completed") return { label: "Done", className: "bg-emerald-600 text-white" };
+  if (s === "live") return { label: "LIVE", className: "bg-[var(--accent)] text-[var(--accent-foreground)]" };
+  if (s === "completed" || s === "final" || finalScore != null) {
+    return { label: "Done", className: "bg-[var(--brand-bright)] text-white" };
+  }
   return { label: "Upcoming", className: "bg-slate-200 text-slate-800" };
 }
 
@@ -39,6 +61,7 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
   const [loadingR, setLoadingR] = useState(false);
   const [errT, setErrT] = useState<string | null>(null);
   const [errR, setErrR] = useState<string | null>(null);
+  const [resultsRoundTab, setResultsRoundTab] = useState<MvpResultsRoundTab>("finals");
 
   const sid = sessionId === "" ? null : sessionId;
 
@@ -51,7 +74,11 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
         const tl = await mvpTimeline(meetKey, sid);
         if (cancelled) return;
         setTimeline(tl);
-        pushMvpRecent({ kind: "meet", meetKey: tl.meet_key, label: tl.meet.name });
+        pushMvpRecent({
+          kind: "meet",
+          meetKey: tl.meet_key,
+          label: mvpMeetPickerLabel(mvpMeetSummaryToHit(tl.meet)),
+        });
       } catch (e) {
         if (cancelled) return;
         setTimeline(null);
@@ -64,6 +91,16 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
       cancelled = true;
     };
   }, [meetKey, sid]);
+
+  useEffect(() => {
+    setResultsRoundTab("finals");
+    setResults([]);
+  }, [meetKey]);
+
+  useEffect(() => {
+    if (!timeline?.meet) return;
+    if (!mvpMeetShowsTimelineTab(timeline.meet)) setTab("results");
+  }, [timeline]);
 
   useEffect(() => {
     if (tab !== "results") return;
@@ -88,29 +125,69 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
     };
   }, [tab, meetKey, sid]);
 
+  useEffect(() => {
+    if (results.length === 0) return;
+    if (!results.some(mvpResultIsFinalsRound)) setResultsRoundTab("prelims");
+  }, [meetKey, results]);
+
   const sessions = timeline?.sessions ?? [];
   const filteredItems: MvpTimelineItem[] = useMemo(() => timeline?.items ?? [], [timeline]);
-  const liveNow = filteredItems.find((i) => !i.is_break && i.status.toLowerCase() === "live");
+  const displayTimelineItems = useMemo(
+    () => dedupeMvpTimelineItems(filteredItems),
+    [filteredItems]
+  );
+  const resultsFilteredByRound = useMemo(
+    () => filterMvpResultsByRoundTab(results, resultsRoundTab),
+    [results, resultsRoundTab]
+  );
+  const displayResultRows = useMemo(
+    () => dedupeMvpResultRows(resultsFilteredByRound),
+    [resultsFilteredByRound]
+  );
+  const headerNameLine = timeline
+    ? mvpMeetHeaderNameLine(timeline.meet, meetKey, MVP_DEFAULT_MEET_KEY, MVP_DEFAULT_MEET_LABEL)
+    : "";
+  const scheduleStatus = getMvpMeetScheduleStatus(timeline?.meet ?? null);
+  const headerLocationLine = timeline ? (timeline.meet.location ?? "").trim() || null : null;
+  const headerDateRangeLine = timeline ? formatMvpMeetDateRangeReadable(timeline.meet) : null;
+  const showTimelineTab = mvpMeetShowsTimelineTab(timeline?.meet);
 
   const loading = tab === "timeline" ? loadingT : loadingR;
   const err = tab === "timeline" ? errT : errR;
 
   return (
     <div className="mx-auto max-w-lg px-4 pb-16 pt-6">
-      <Link href="/" className="mb-4 inline-block text-sm font-medium text-[var(--brand)]">
-        ← Search
+      <Link href="/" className="mb-4 inline-block text-sm font-medium text-[var(--brand-bright)]">
+        ← Home
       </Link>
 
-      {timeline && (
-        <header className="mb-4 rounded-2xl bg-[var(--brand)] px-4 py-4 text-white shadow-lg">
-          <h1 className="text-lg font-bold leading-tight">{timeline.meet.name}</h1>
-          <p className="mt-1 text-sm opacity-90">
-            {[timeline.meet.location, timeline.meet.start_date].filter(Boolean).join(" · ")}
-          </p>
-          {liveNow && (
-            <p className="mt-3 rounded-lg bg-white/15 px-3 py-2 text-sm font-semibold">
-              Live now · {liveNow.team_name} {liveNow.team_level ? `(${liveNow.team_level})` : ""}
-            </p>
+      {timeline && headerNameLine && (
+        <header className="mb-4 rounded-2xl bg-gradient-to-br from-[var(--brand)] via-[#003d52] to-[var(--brand-bright)] px-4 py-4 text-white shadow-lg">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0 flex-1">
+              <h1 className="text-lg font-bold uppercase leading-tight tracking-wide">{headerNameLine}</h1>
+            </div>
+            {scheduleStatus.tone !== "past" && (
+              <span
+                className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold ${
+                  scheduleStatus.tone === "live"
+                    ? "bg-red-500 text-white"
+                    : "bg-amber-400 text-black"
+                }`}
+              >
+                {scheduleStatus.label}
+              </span>
+            )}
+          </div>
+          {(headerLocationLine || headerDateRangeLine) && (
+            <div className="mt-3 flex items-start justify-between gap-4 border-t border-white/20 pt-3 text-sm leading-snug">
+              <div className="min-w-0 flex-1 text-white/90">
+                {headerLocationLine ? <p>{headerLocationLine}</p> : null}
+              </div>
+              {headerDateRangeLine && (
+                <p className="max-w-[58%] shrink-0 text-right font-medium text-white">{headerDateRangeLine}</p>
+              )}
+            </div>
           )}
         </header>
       )}
@@ -141,25 +218,66 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
         </div>
       )}
 
-      <div className="mb-4 flex gap-2 rounded-xl bg-slate-200/80 p-1">
-        <button
-          type="button"
-          onClick={() => setTab("timeline")}
-          className={`flex-1 rounded-lg py-2 text-sm font-semibold ${
-            tab === "timeline" ? "bg-white text-[var(--brand)] shadow" : "text-[var(--muted)]"
-          }`}
-        >
-          Timeline
-        </button>
-        <button
-          type="button"
-          onClick={() => setTab("results")}
-          className={`flex-1 rounded-lg py-2 text-sm font-semibold ${
-            tab === "results" ? "bg-white text-[var(--brand)] shadow" : "text-[var(--muted)]"
-          }`}
-        >
-          Results
-        </button>
+      <div className="mb-4 overflow-hidden rounded-2xl border border-slate-200 bg-slate-100/90 shadow-sm ring-1 ring-slate-200/60">
+        {showTimelineTab ? (
+          <div className="flex gap-1 p-1">
+            <button
+              type="button"
+              onClick={() => setTab("timeline")}
+              className={`flex-1 rounded-full py-2 text-sm font-bold uppercase tracking-wide ${
+                tab === "timeline"
+                  ? "bg-[var(--accent)] text-[var(--accent-foreground)] shadow-sm"
+                  : "text-[var(--muted)]"
+              }`}
+            >
+              Timeline
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab("results")}
+              className={`flex-1 rounded-full py-2 text-sm font-bold uppercase tracking-wide ${
+                tab === "results"
+                  ? "bg-[var(--accent)] text-[var(--accent-foreground)] shadow-sm"
+                  : "text-[var(--muted)]"
+              }`}
+            >
+              Results
+            </button>
+          </div>
+        ) : (
+          <div
+            className="bg-[var(--accent)] px-3 py-2 text-center text-sm font-bold uppercase tracking-wide text-[var(--accent-foreground)]"
+            role="status"
+          >
+            Results
+          </div>
+        )}
+        {tab === "results" && (
+          <div className="flex gap-1 border-t border-slate-200/80 bg-slate-50/95 p-1">
+            <button
+              type="button"
+              onClick={() => setResultsRoundTab("finals")}
+              className={`flex-1 rounded-full py-1.5 text-xs font-bold uppercase tracking-wide ${
+                resultsRoundTab === "finals"
+                  ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200"
+                  : "text-[var(--muted)]"
+              }`}
+            >
+              Finals
+            </button>
+            <button
+              type="button"
+              onClick={() => setResultsRoundTab("prelims")}
+              className={`flex-1 rounded-full py-1.5 text-xs font-bold uppercase tracking-wide ${
+                resultsRoundTab === "prelims"
+                  ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200"
+                  : "text-[var(--muted)]"
+              }`}
+            >
+              Prelims
+            </button>
+          </div>
+        )}
       </div>
 
       {loading && <p className="text-sm text-[var(--muted)]">Loading…</p>}
@@ -167,7 +285,7 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
 
       {!loading && tab === "timeline" && timeline && (
         <ol className="space-y-2">
-          {filteredItems.map((row) => {
+          {displayTimelineItems.map((row) => {
             if (row.is_break) {
               return (
                 <li
@@ -179,7 +297,11 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
                 </li>
               );
             }
-            const st = statusTone(row.status);
+            const st = statusTone(row.status, row.final_score);
+            const sessionLine = row.session_name?.trim() || "";
+            const extraMeta = [row.team_level, row.team_division, row.round].filter(Boolean).filter(
+              (bit) => !sessionLine.toLowerCase().includes(String(bit).toLowerCase())
+            );
             return (
               <li
                 key={row.performance_id}
@@ -195,10 +317,15 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
                       {st.label}
                     </span>
                   </div>
-                  <div className="mt-0.5 text-xs text-[var(--muted)]">
-                    {[row.team_level, row.team_division, row.round].filter(Boolean).join(" · ")}
-                  </div>
-                  <div className="mt-1 text-[10px] uppercase tracking-wide text-slate-400">{row.session_name}</div>
+                  {row.team_gym_name && (
+                    <div className="mt-0.5 text-xs font-medium text-[var(--gym)]">{row.team_gym_name}</div>
+                  )}
+                  {sessionLine && (
+                    <div className="mt-0.5 text-xs text-[var(--muted)]">{sessionLine}</div>
+                  )}
+                  {extraMeta.length > 0 && (
+                    <div className="mt-0.5 text-[10px] text-slate-500">{extraMeta.join(" · ")}</div>
+                  )}
                 </div>
               </li>
             );
@@ -208,31 +335,34 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
 
       {!loading && tab === "results" && (
         <ol className="space-y-2">
-          {results.length === 0 ? (
+          {displayResultRows.length === 0 ? (
             <p className="text-sm text-[var(--muted)]">No scored routines for this filter yet.</p>
           ) : (
-            results.map((r, idx) => (
-              <li
-                key={`${r.team_name}-${idx}`}
-                className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3 py-3 shadow-sm"
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="font-semibold text-[var(--text)]">
-                    {medalForRank(r.rank)}
-                    {r.team_name}
+            displayResultRows.map((r, idx) => {
+              const sessionLine = r.session_name?.trim() || "";
+              const extras = [r.team_level, r.team_division].filter(Boolean).filter(
+                (bit) => !sessionLine.toLowerCase().includes(String(bit).toLowerCase())
+              );
+              const line = [sessionLine, ...extras].filter(Boolean).join(" · ");
+              return (
+                <li
+                  key={`${r.team_name}-${r.session_id}-${idx}`}
+                  className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3 py-3 shadow-sm"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="font-semibold text-[var(--text)]">
+                      {medalForRank(r.rank)}
+                      {r.team_name}
+                    </div>
+                    {r.team_gym_name && (
+                      <div className="text-xs font-medium text-[var(--gym)]">{r.team_gym_name}</div>
+                    )}
+                    {line && <div className="text-xs text-[var(--muted)]">{line}</div>}
                   </div>
-                  <div className="text-xs text-[var(--muted)]">
-                    {[r.team_level, r.team_division, r.session_name].filter(Boolean).join(" · ")}
-                  </div>
-                </div>
-                <div className="shrink-0 text-right">
-                  <div className="text-lg font-bold tabular-nums text-[var(--brand)]">{r.final_score.toFixed(2)}</div>
-                  {r.deductions != null && (
-                    <div className="text-[10px] text-[var(--muted)]">−{r.deductions.toFixed(2)} ded.</div>
-                  )}
-                </div>
-              </li>
-            ))
+                  <MvpResultScoreBreakdown r={r} showRankOrdinal={false} />
+                </li>
+              );
+            })
           )}
         </ol>
       )}

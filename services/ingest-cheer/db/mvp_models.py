@@ -1,11 +1,15 @@
 """Cheer MVP schema: teams, meets, sessions, performances (timeline + scores)."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, Column, Date, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
 from db.database import Base
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class CheerMvpTeam(Base):
@@ -17,6 +21,8 @@ class CheerMvpTeam(Base):
     level = Column(String(64))
     division = Column(String(255))
     normalized_division = Column(String(255))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now)
 
     performances = relationship("CheerMvpPerformance", back_populates="team")
 
@@ -31,6 +37,8 @@ class CheerMvpMeet(Base):
     start_date = Column(Date)
     end_date = Column(Date)
     source = Column(String(64))
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now)
 
     sessions = relationship("CheerMvpSession", back_populates="meet")
     performances = relationship("CheerMvpPerformance", back_populates="meet")
@@ -44,6 +52,8 @@ class CheerMvpSession(Base):
     name = Column(String(255), nullable=False)
     display_order = Column(Integer, nullable=False, default=0)
     start_time = Column(DateTime)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now)
 
     meet = relationship("CheerMvpMeet", back_populates="sessions")
     performances = relationship("CheerMvpPerformance", back_populates="session")
@@ -66,8 +76,12 @@ class CheerMvpPerformance(Base):
     status = Column(String(32), nullable=False, default="upcoming")
     display_order = Column(Integer, nullable=False, default=0)
     final_score = Column(Float)
+    raw_score = Column(Float)
+    performance_score = Column(Float)
     rank = Column(Integer)
     deductions = Column(Float)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now)
 
     meet = relationship("CheerMvpMeet", back_populates="performances")
     session = relationship("CheerMvpSession", back_populates="performances")

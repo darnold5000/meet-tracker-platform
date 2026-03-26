@@ -1,0 +1,18 @@
+# Used by `gcloud builds submit services/ingest-cheer`.
+# When present, this file controls the upload (see `gcloud topic gcloudignore`).
+# Keep ignores minimal so cheer_ingest_main.py and ingest.py are never dropped.
+
+.gcloudignore
+.git/
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.env
+.env.*
+*.log
+htmlcov/
+.coverage
+db/migrations/versions/
+.DS_Store

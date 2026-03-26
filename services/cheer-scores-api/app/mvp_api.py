@@ -41,7 +41,7 @@ def mvp_search(q: str = Query("", min_length=0, max_length=200)):
                 SELECT meet_key, name, location, start_date, end_date
                 FROM cheer_mvp_meets
                 ORDER BY start_date DESC NULLS LAST, name
-                LIMIT 15
+                LIMIT 120
                 """
             )
         else:
@@ -130,6 +130,8 @@ def mvp_meet_timeline(
               p.break_label,
               p.round,
               p.final_score,
+              p.raw_score,
+              p.performance_score,
               p.rank,
               p.deductions,
               p.team_id,
@@ -192,6 +194,8 @@ def mvp_meet_results(
             SELECT
               p.rank,
               p.final_score,
+              p.raw_score,
+              p.performance_score,
               p.deductions,
               t.name AS team_name,
               t.gym_name AS team_gym_name,

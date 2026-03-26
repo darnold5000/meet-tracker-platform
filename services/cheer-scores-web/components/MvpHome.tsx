@@ -3,18 +3,9 @@
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { mvpSearch } from "@/lib/mvpApi";
+import { formatMvpMeetWhen, humanizedMeetName, mvpMeetPickerLabel } from "@/lib/mvpMeetDisplay";
 import type { MvpMeetHit, MvpRecentItem, MvpSearchResponse, MvpTeamHit } from "@/lib/mvpTypes";
 import { pushMvpRecent, readMvpRecents } from "@/lib/mvpRecents";
-
-function formatMeetWhen(m: MvpMeetHit): string {
-  if (!m.start_date) return "";
-  try {
-    const d = new Date(m.start_date + "T12:00:00");
-    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
-  } catch {
-    return m.start_date;
-  }
-}
 
 export function MvpHome() {
   const [q, setQ] = useState("");
@@ -52,7 +43,7 @@ export function MvpHome() {
   }, [debounced, runSearch]);
 
   const onOpenMeet = (m: MvpMeetHit) => {
-    pushMvpRecent({ kind: "meet", meetKey: m.meet_key, label: m.name });
+    pushMvpRecent({ kind: "meet", meetKey: m.meet_key, label: mvpMeetPickerLabel(m) });
     setRecents(readMvpRecents());
   };
 
@@ -63,7 +54,13 @@ export function MvpHome() {
 
   return (
     <div className="mx-auto max-w-lg px-4 pb-16 pt-8">
-      <header className="mb-6 rounded-2xl bg-[var(--brand)] px-4 py-4 text-white shadow-lg">
+      <Link
+        href="/"
+        className="mb-4 inline-block text-sm font-medium text-[var(--brand-bright)]"
+      >
+        ← Competition view
+      </Link>
+      <header className="mb-6 rounded-2xl bg-gradient-to-br from-[var(--brand)] via-[#003d52] to-[var(--brand-bright)] px-4 py-4 text-white shadow-lg">
         <h1 className="text-lg font-bold tracking-tight">Cheer scores</h1>
         <p className="mt-1 text-sm opacity-90">Search teams or competitions</p>
       </header>
@@ -123,9 +120,11 @@ export function MvpHome() {
                       onClick={() => onOpenMeet(m)}
                       className="block rounded-xl border border-slate-200 bg-white p-3 shadow-sm transition hover:border-[var(--brand)]"
                     >
-                      <div className="font-semibold text-[var(--text)]">{m.name}</div>
+                      <div className="font-semibold text-[var(--text)]">
+                        {humanizedMeetName(m.name) || m.meet_key}
+                      </div>
                       <div className="mt-0.5 text-xs text-[var(--muted)]">
-                        {[m.location, formatMeetWhen(m)].filter(Boolean).join(" · ")}
+                        {[m.location, formatMvpMeetWhen(m)].filter(Boolean).join(" · ")}
                       </div>
                     </Link>
                   </li>

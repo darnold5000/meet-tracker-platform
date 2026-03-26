@@ -6,6 +6,7 @@ Job schedule:
   - scorecat_polling   → every 10s (only for active meets)
   - mso_scrape         → every 60 minutes
   - website_crawl      → every 6 hours
+  - varsity_cheer_mvp_sync → every N hours (optional; VARSITY_INGEST_ENABLED=1)
 """
 
 import os
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 MEET_DISCOVERY_HOUR = int(os.getenv("MEET_DISCOVERY_HOUR", "6"))
 MSO_SCRAPE_INTERVAL_MINUTES = int(os.getenv("MSO_SCRAPE_INTERVAL_MINUTES", "60"))
 WEBSITE_CRAWL_INTERVAL_HOURS = int(os.getenv("WEBSITE_CRAWL_INTERVAL_HOURS", "6"))
+VARSITY_INGEST_INTERVAL_HOURS = int(os.getenv("VARSITY_INGEST_INTERVAL_HOURS", "6"))
+VARSITY_RESULTS_MAX_ITEMS = int(os.getenv("VARSITY_RESULTS_MAX_ITEMS", "200"))
 
 
 # ── Job functions ─────────────────────────────────────────────────────────────
@@ -68,6 +71,28 @@ def job_mso_scrape():
         db.close()
 
 
+def job_varsity_cheer_mvp_sync():
+    """Periodic: Varsity TV schedule + results index → CheerMvpMeet upserts."""
+    logger.info("[SCHEDULER] Running Varsity → cheer_mvp_meets sync")
+    from agents.varsity_client import sync_cheer_mvp_meets_from_varsity
+    from db.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        stats = sync_cheer_mvp_meets_from_varsity(
+            db, results_max_items=VARSITY_RESULTS_MAX_ITEMS
+        )
+    finally:
+        db.close()
+
+    logger.info(
+        "[SCHEDULER] Varsity sync done: inserted=%s updated=%s merged=%s",
+        stats["inserted"],
+        stats["updated"],
+        stats["total_merged"],
+    )
+
+
 def job_website_crawl():
     """Every 6 hours: parse meet websites for PDF/HTML results."""
     logger.info("[SCHEDULER] Running website crawl job")
@@ -101,6 +126,11 @@ def job_website_crawl():
 
 def create_scheduler() -> BackgroundScheduler:
     scheduler = BackgroundScheduler(timezone="America/New_York")
+    varsity_enabled = os.getenv("VARSITY_INGEST_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
     # Daily meet discovery
     scheduler.add_job(
@@ -128,6 +158,15 @@ def create_scheduler() -> BackgroundScheduler:
         name="Meet website crawl",
         replace_existing=True,
     )
+
+    if varsity_enabled:
+        scheduler.add_job(
+            job_varsity_cheer_mvp_sync,
+            trigger=IntervalTrigger(hours=VARSITY_INGEST_INTERVAL_HOURS),
+            id="varsity_cheer_mvp_sync",
+            name="Varsity TV → cheer_mvp_meets",
+            replace_existing=True,
+        )
 
     return scheduler
 

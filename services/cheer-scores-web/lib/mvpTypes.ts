@@ -47,6 +47,8 @@ export type MvpTimelineItem = {
   break_label: string | null;
   round: string | null;
   final_score: number | null;
+  raw_score: number | null;
+  performance_score: number | null;
   rank: number | null;
   deductions: number | null;
   team_id: number | null;
@@ -69,6 +71,8 @@ export type MvpTimelineResponse = {
 export type MvpResultRow = {
   rank: number | null;
   final_score: number;
+  raw_score: number | null;
+  performance_score: number | null;
   deductions: number | null;
   team_name: string;
   team_gym_name: string | null;

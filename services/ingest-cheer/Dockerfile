@@ -13,9 +13,14 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Playwright base image includes browsers; ensure they are present
 RUN playwright install chromium
 
+# Fail the build if this file is missing from the Cloud Build upload (gcloudignore, etc.).
+COPY cheer_ingest_main.py /app/cheer_ingest_main.py
+
 # Copy project
 COPY . /app
 
-# Default job command; Cloud Run Job can override args.
-CMD ["python", "ingest.py", "--scrape-limit", "1", "--use-target-meets"]
+# Default: cheer-only Varsity score sync (no MSO / gymnastics ingest.py).
+# Entrypoint lives at repo root (same pattern as ingest.py) so Cloud Run args stay simple.
+# Override command to run legacy gym pipeline: python,ingest.py,--scrape-limit,1,--use-target-meets
+CMD ["python", "cheer_ingest_main.py"]
 

@@ -1,0 +1,35 @@
+# Used by `gcloud builds submit services/cheer-scores-web` (see `gcloud topic gcloudignore`).
+# Docker installs deps and runs `next build` in the image — do not upload local caches.
+
+.git/
+.gitignore
+.gcloudignore
+
+# Dependencies & Next.js output (rebuilt in Docker)
+node_modules/
+.next/
+out/
+.turbo/
+.vercel/
+
+# Env and local secrets (never upload to Cloud Build context)
+.env
+.env.*
+
+# Logs, coverage, caches
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+coverage/
+.nyc_output/
+*.tsbuildinfo
+.eslintcache
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/

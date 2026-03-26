@@ -1,0 +1,16 @@
+# Build cheer ingest image (Playwright + MSO/Varsity ingest) for Cloud Run Jobs.
+# From repo root:
+#   gcloud builds submit services/ingest-cheer --config services/ingest-cheer/cloudbuild.yaml
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "build"
+      - "--tag"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/cheer-ingest:latest"
+      - "."
+  - name: "gcr.io/cloud-builders/docker"
+    args:
+      - "push"
+      - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/cheer-ingest:latest"
+options:
+  logging: CLOUD_LOGGING_ONLY
