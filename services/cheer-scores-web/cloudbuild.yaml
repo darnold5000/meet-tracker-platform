@@ -15,6 +15,6 @@ steps:
       - "push"
       - "us-central1-docker.pkg.dev/meet-tracker-490603/containers/cheer-scores-web:latest"
 substitutions:
-  _NEXT_PUBLIC_API_URL: "https://YOUR-CHEER-SCORES-API.run.app"
+  _NEXT_PUBLIC_API_URL: "https://cheer-scores-api-617613197143.us-central1.run.app"
 options:
   logging: CLOUD_LOGGING_ONLY
