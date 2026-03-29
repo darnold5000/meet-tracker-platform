@@ -12,6 +12,34 @@ export function stripSessionRoundSuffix(sessionName: string): string {
     .trim();
 }
 
+function stemNorm(s: string): string {
+  return stripSessionRoundSuffix(s).trim().toLowerCase();
+}
+
+/**
+ * Level/division strings to show next to ``session_name`` on result cards.
+ * Skips chips that only repeat the same division with a different Prelims/Finals suffix (Varsity ingest often
+ * sets ``session_name`` to one round and ``team_division`` to another).
+ */
+export function mvpResultRowMetaExtras(
+  sessionName: string,
+  teamLevel: string | null | undefined,
+  teamDivision: string | null | undefined
+): string[] {
+  const sessionLine = sessionName.trim();
+  const sStem = sessionLine ? stemNorm(sessionLine) : "";
+  const out: string[] = [];
+  for (const raw of [teamLevel, teamDivision]) {
+    if (!raw) continue;
+    const bit = String(raw).trim();
+    if (!bit) continue;
+    if (sessionLine && sessionLine.toLowerCase().includes(bit.toLowerCase())) continue;
+    if (sStem && sStem === stemNorm(bit)) continue;
+    out.push(bit);
+  }
+  return out;
+}
+
 /** Higher score = more important round when picking one row per team+division. */
 export function roundPriority(sessionName: string, round: string | null | undefined): number {
   const t = `${sessionName} ${round ?? ""}`.toLowerCase();
@@ -28,12 +56,37 @@ export function mvpResultIsFinalsRound(r: Pick<MvpResultRow, "session_name" | "r
 
 export type MvpResultsRoundTab = "finals" | "prelims";
 
+/** Whether the result set includes scored rows for each round tab (before `filterMvpResultsByRoundTab`). */
+export function mvpResultsRoundAvailability(rows: MvpResultRow[]): {
+  hasFinals: boolean;
+  hasPrelims: boolean;
+} {
+  let hasFinals = false;
+  let hasPrelims = false;
+  for (const r of rows) {
+    if (mvpResultIsFinalsRound(r)) hasFinals = true;
+    else hasPrelims = true;
+    if (hasFinals && hasPrelims) break;
+  }
+  return { hasFinals, hasPrelims };
+}
+
 /** Filter API rows for Finals vs Prelims (prelims tab includes semi-finals and unlabeled rounds). */
 export function filterMvpResultsByRoundTab(
   rows: MvpResultRow[],
   tab: MvpResultsRoundTab
 ): MvpResultRow[] {
   return rows.filter((r) => (tab === "finals" ? mvpResultIsFinalsRound(r) : !mvpResultIsFinalsRound(r)));
+}
+
+/**
+ * Default Results tab: prefer Finals whenever that round has any scores (published cheer finals
+ * are the usual “official” outcome). Prelims-only → prelims; neither → finals (empty state).
+ */
+export function mvpSuggestResultsRoundTab(rows: MvpResultRow[]): MvpResultsRoundTab {
+  const { hasFinals, hasPrelims } = mvpResultsRoundAvailability(rows);
+  if (!hasFinals && hasPrelims) return "prelims";
+  return "finals";
 }
 
 function timelineDedupeKey(row: MvpTimelineItem): string {
@@ -79,11 +132,13 @@ export function dedupeMvpTimelineItems(items: MvpTimelineItem[]): MvpTimelineIte
   return [...merged, ...breaks];
 }
 
-/** Session + level + division bucket (all teams in the same scored group). */
+/**
+ * Bucket for “same scored mat / division block”. Use session id only: every performance in one Varsity
+ * table shares one MVP session, while team-level / division strings can be null or inconsistent across
+ * rows and would incorrectly split standings when drilling into a team.
+ */
 export function mvpResultDivisionBucketKey(r: MvpResultRow): string {
-  const lv = (r.team_level ?? "").trim().toLowerCase();
-  const div = (r.team_division ?? "").trim().toLowerCase();
-  return `${r.session_id}\0${lv}\0${div}`;
+  return String(r.session_id);
 }
 
 function resultDedupeKey(r: MvpResultRow): string {

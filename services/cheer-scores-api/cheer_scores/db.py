@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 
 @lru_cache(maxsize=1)
@@ -24,4 +24,25 @@ def fetch_all(sql: str, params: dict | None = None) -> list[dict]:
 def fetch_one(sql: str, params: dict | None = None) -> dict | None:
     rows = fetch_all(sql, params=params)
     return rows[0] if rows else None
+
+
+def ensure_cheer_mvp_meet_datetime_columns() -> None:
+    """Idempotent Postgres DDL for ``starts_at`` / ``ends_at`` on ``cheer_mvp_meets``."""
+    eng = engine()
+    if eng.dialect.name not in ("postgresql", "postgres"):
+        return
+    insp = inspect(eng)
+    if "cheer_mvp_meets" not in insp.get_table_names():
+        return
+    existing = {c["name"] for c in insp.get_columns("cheer_mvp_meets")}
+    stmts: list[str] = []
+    if "starts_at" not in existing:
+        stmts.append("ALTER TABLE cheer_mvp_meets ADD COLUMN starts_at TIMESTAMPTZ")
+    if "ends_at" not in existing:
+        stmts.append("ALTER TABLE cheer_mvp_meets ADD COLUMN ends_at TIMESTAMPTZ")
+    if not stmts:
+        return
+    with eng.begin() as conn:
+        for ddl in stmts:
+            conn.execute(text(ddl))
 

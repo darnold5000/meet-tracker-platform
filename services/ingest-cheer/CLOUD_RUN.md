@@ -18,6 +18,8 @@ It syncs **Varsity TV event results** (division/round score tables from the even
 - `CHEER_VAR_EVENT_IDS` — e.g. `14479023,14479024` to sync those events **on every run**, ignoring the date filter (useful for testing or a fixed roster)
 - `CHEER_VAR_SYNC_UNDATED_MEETS` — `1` / `true` to also sync `VARSITY-*` rows with **no** `start_date`/`end_date`
 - `CHEER_USE_CODE_TARGET_LIST` — set to `0` / `false` to ignore the hardcoded list in `core/cheer_target_meets.py` (DB-only mode)
+- `CHEER_HUB_VIEW_ALL_HTTPS_PROXY` (or `CHEER_HUB_VIEW_ALL_PROXY`) — HTTPS proxy URL used **only** for `tv.varsity.com` “view all” HTML when Flo returns **HTTP 406** from Cloud Run / datacenter egress
+- `VARSITY_TV_EVENTS_PATH` — optional `/events/<segment>/` override (e.g. `14478900-2026-one-up-grand-nationals`); ingest normally takes this from hub `slugUri`
 
 **Do not put `CHEER_VAR_EVENT_IDS=…` in job “Arguments”.** Cloud Run passes each arg to Python; `cheer_ingest_main.py` will error with `unrecognized arguments`. Set it as an **environment variable** on the job (or use `--event-id` in args — see below).
 
@@ -29,6 +31,14 @@ It syncs **Varsity TV event results** (division/round score tables from the even
 - **Args (alternative):** keep args as **only** `cheer_ingest_main.py` **or** add flags: `--args=cheer_ingest_main.py,--event-id,14478875` (repeat `--event-id` for multiple).
 
 **Code target list (like `TARGET_MEETS` for MSO):** edit `core/cheer_target_meets.py` → `CHEER_TARGET_VAR_EVENTS`. Each row has `event_id`, optional `name`, optional `start_date` / `end_date`. If both dates are omitted, that event is synced **every** scheduled run until you remove it.
+
+### Meet appears in the schedule but ingest shows `no_result_rows` / empty MVP
+
+Cheer ingest **only** loads division/score **tables** from Flo’s JSON:
+
+`GET …/api/experiences/web/event-hub/<event_id>/results`
+
+The **event ticker** (broadcast schedule strip) is a **different** feed. Flo may list a competition there while returning **“Results not found for event … (api.flosports.tv)”** (HTTP 200 with `httpStatus: 404` in the JSON) for the hub — in that case **no sessions or performances** are written. Confirm the **`event_id`** in the Varsity/Flo event URL matches `VARSITY-<id>` in `cheer_mvp_meets`; if the hub stays empty until meet day, scores simply are not published to that API yet.
 
 **Create / update job (no MSO env vars)**
 

@@ -541,7 +541,7 @@ export function MeetView({ meetKey = DEFAULT_MEET_KEY, meetName }: MeetViewProps
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-semibold uppercase tracking-wide opacity-90">
-              {meetInfo?.name || meetName || "Cheer scores"}
+              {meetInfo?.name || meetName || "Cheer Tracker"}
             </p>
             {(locationLine || dateRangeLine) && (
               <p className="mt-0.5 truncate text-xs opacity-80">

@@ -8,6 +8,7 @@ Examples:
   python scripts/ingest_varsity.py --rankings
   python scripts/ingest_varsity.py --ranking-table 6811625 36950
   python scripts/ingest_varsity.py --sync-meets
+  python scripts/ingest_varsity.py --upcoming
   python scripts/ingest_varsity.py --event-results 14479023
   python scripts/ingest_varsity.py --event-results 14479023 --event-results-sync-db \\
       --event-name "2026 Athletic Championships Atlanta Nationals"
@@ -38,8 +39,29 @@ def _row_json(row: dict) -> dict:
 def cmd_schedule(_args: argparse.Namespace) -> int:
     from agents.varsity_client import fetch_schedule_events
 
-    for row in fetch_schedule_events():
+    rows = fetch_schedule_events()
+    for row in rows:
         print(json.dumps(_row_json(row), ensure_ascii=False))
+    if rows:
+        print(
+            "Note: --schedule only prints JSON. To upsert into cheer_mvp_meets, run --sync-meets (DATABASE_URL).",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_upcoming(args: argparse.Namespace) -> int:
+    from agents.varsity_client import top_upcoming_schedule_events_from_ticker
+
+    for row in top_upcoming_schedule_events_from_ticker(
+        limit=args.upcoming_limit, exclude_rebroadcast=True
+    ):
+        print(json.dumps(_row_json(row), ensure_ascii=False))
+    print(
+        "Note: --upcoming only prints JSON. To upsert meets into Postgres (cheer_mvp_meets), "
+        "set DATABASE_URL and run: python scripts/ingest_varsity.py --sync-meets",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -140,7 +162,22 @@ def cmd_sync_meets(args: argparse.Namespace) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Varsity TV ingest (schedule, results, rankings)")
-    p.add_argument("--schedule", action="store_true", help="Print event-ticker events (JSON lines)")
+    p.add_argument(
+        "--schedule",
+        action="store_true",
+        help="Print all event-ticker events to stdout (no DB). Use --sync-meets to persist.",
+    )
+    p.add_argument(
+        "--upcoming",
+        action="store_true",
+        help="Print next N ticker events to stdout only (no DB). Use --sync-meets to persist meets.",
+    )
+    p.add_argument(
+        "--upcoming-limit",
+        type=int,
+        default=3,
+        help="Row count for --upcoming (default 3)",
+    )
     p.add_argument("--results", action="store_true", help="Print paginated results index (JSON lines)")
     p.add_argument(
         "--results-limit",
@@ -197,6 +234,7 @@ def main() -> int:
     args = p.parse_args()
     if not (
         args.schedule
+        or args.upcoming
         or args.results
         or args.rankings
         or args.ranking_table
@@ -208,6 +246,8 @@ def main() -> int:
 
     if args.schedule:
         return cmd_schedule(args)
+    if args.upcoming:
+        return cmd_upcoming(args)
     if args.results:
         return cmd_results(args)
     if args.rankings:

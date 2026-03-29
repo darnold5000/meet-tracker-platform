@@ -42,21 +42,47 @@ _extra_cors = [
     if o.strip()
 ]
 
+# Browser fetches from https://cheer-scores-web-….run.app (or *.a.run.app); allow without
+# listing every revision URL in CHEER_SCORES_CORS_ORIGINS. Disable with CHEER_SCORES_CORS_NO_RUN_APP_REGEX=1.
+_run_app_cors_regex = os.getenv("CHEER_SCORES_CORS_NO_RUN_APP_REGEX", "").strip().lower() not in (
+    "1",
+    "true",
+    "yes",
+)
+
 app = FastAPI(title="Cheer Scores")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+
+@app.on_event("startup")
+def _ensure_cheer_mvp_schema() -> None:
+    try:
+        from cheer_scores.db import ensure_cheer_mvp_meet_datetime_columns
+
+        ensure_cheer_mvp_meet_datetime_columns()
+    except Exception:
+        import logging
+
+        logging.getLogger("uvicorn.error").warning(
+            "cheer_mvp_meets datetime columns ensure skipped", exc_info=True
+        )
+
+_cors_kw: dict[str, Any] = {
+    "allow_origins": [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
         *_extra_cors,
     ],
-    allow_credentials=True,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
-)
+    "allow_credentials": True,
+    "allow_methods": ["GET", "OPTIONS"],
+    "allow_headers": ["*"],
+}
+if _run_app_cors_regex:
+    # Cloud Run web URLs + Vercel preview/production (*.vercel.app). Custom domains need
+    # CHEER_SCORES_CORS_ORIGINS=https://yourdomain.com
+    _cors_kw["allow_origin_regex"] = r"https://.*\.(run\.app|vercel\.app)$"
+app.add_middleware(CORSMiddleware, **_cors_kw)
 
 static_dir = PROJECT_DIR / "app" / "static"
 templates = Jinja2Templates(directory=str(PROJECT_DIR / "app" / "templates"))

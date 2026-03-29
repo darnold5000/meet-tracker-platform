@@ -1,39 +1,54 @@
 "use client";
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { mvpResults, mvpSearch, mvpTimeline } from "@/lib/mvpApi";
-import { MVP_DEFAULT_MEET_KEY, MVP_DEFAULT_MEET_LABEL } from "@/lib/mvpDefaults";
+import { MVP_DEFAULT_GYM_FILTER, MVP_DEFAULT_MEET_KEY, MVP_DEFAULT_MEET_LABEL } from "@/lib/mvpDefaults";
 import {
   dedupeMvpResultRows,
   dedupeMvpTimelineItems,
   filterMvpResultsByRoundTab,
   mvpGymMatches,
   mvpResultDivisionBucketKey,
-  mvpResultIsFinalsRound,
-  withSequentialResultRanks,
+  mvpResultRowMetaExtras,
+  mvpResultsRoundAvailability,
+  mvpSuggestResultsRoundTab,
+  sortMvpResultsStandings,
   type MvpResultsRoundTab,
 } from "@/lib/mvpDedupe";
 import {
   formatMvpMeetDateRangeReadable,
+  formatMvpMeetStartsAtReadable,
+  getMvpMeetHitPickerBucket,
   getMvpMeetScheduleStatus,
+  mvpCoalesceMeetLocation,
   mvpMeetHeaderNameLine,
   mvpMeetShowsTimelineTab,
   mvpMeetHeaderTitle,
   mvpMeetPickerLabel,
   mvpMeetSummaryToHit,
+  mvpResultRowScheduleCaption,
+  mvpTimelineWhenDisplay,
+  type MvpMeetPickerTimeBucket,
 } from "@/lib/mvpMeetDisplay";
-import type { MvpMeetHit, MvpResultRow, MvpTimelineItem, MvpTimelineResponse } from "@/lib/mvpTypes";
+import type {
+  MvpMeetHit,
+  MvpMeetSummary,
+  MvpResultRow,
+  MvpTimelineItem,
+  MvpTimelineResponse,
+} from "@/lib/mvpTypes";
 import { pushMvpRecent } from "@/lib/mvpRecents";
 import { MvpResultScoreBreakdown } from "@/components/MvpResultScoreBreakdown";
+import { MvpAboutBanner } from "@/components/MvpAboutBanner";
+import { MvpInstallHintBanner } from "@/components/MvpPwaInstallProvider";
+import { MvpResultsRoundPills } from "@/components/MvpResultsRoundPills";
+import { MvpMeetResultsScheduleTabs } from "@/components/MvpMeetResultsScheduleTabs";
+import { varsityOfficialScheduleUrlForMeetKey } from "@/lib/mvpVarsityLinks";
+import { openTallyFeedback, TALLY_FEEDBACK_FORM_ID } from "@/lib/feedback";
+import { useMvpLiveAutoRefresh } from "@/lib/useMvpLiveAutoRefresh";
 
 const DEFAULT_MEET_KEY = MVP_DEFAULT_MEET_KEY;
 const DEFAULT_MEET_LABEL = MVP_DEFAULT_MEET_LABEL;
-const DEFAULT_MEET_STATE = (process.env.NEXT_PUBLIC_DEFAULT_MEET_STATE ?? "GA").trim() || "GA";
-
-interface BeforeInstallPromptEvent extends Event {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
-}
 
 function inferStateFromLocation(loc: string | null | undefined): string | null {
   if (!loc) return null;
@@ -41,14 +56,55 @@ function inferStateFromLocation(loc: string | null | undefined): string | null {
   return m ? m[1].toUpperCase() : null;
 }
 
-function formatTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  } catch {
-    return iso;
+/** Parse `starts_at` or `start_date` for sorting (ms since epoch). */
+function mvpMeetSortTimestamp(m: MvpMeetHit): number {
+  const raw =
+    (m.starts_at ?? "").trim() ||
+    (m.start_date ? `${m.start_date}T12:00:00` : "") ||
+    (m.ends_at ?? "").trim() ||
+    (m.end_date ? `${m.end_date}T12:00:00` : "");
+  if (!raw) return 0;
+  const t = Date.parse(raw.includes("T") ? raw : `${raw}T12:00:00`);
+  return Number.isFinite(t) ? t : 0;
+}
+
+const MEET_PICKER_TIME_SECTIONS: readonly { key: MvpMeetPickerTimeBucket; label: string }[] = [
+  { key: "upcoming", label: "Upcoming" },
+  { key: "recent", label: "Recent" },
+  { key: "past", label: "Past" },
+];
+
+function buildMeetPickerTimeSections(
+  meets: MvpMeetHit[],
+  defaultMeetKey: string
+): Array<{ key: string; label: string; meets: MvpMeetHit[] }> {
+  const buckets: Record<MvpMeetPickerTimeBucket, MvpMeetHit[]> = {
+    upcoming: [],
+    recent: [],
+    past: [],
+  };
+  for (const m of meets) {
+    buckets[getMvpMeetHitPickerBucket(m)].push(m);
   }
+
+  const pinDefaultFirst = (rows: MvpMeetHit[]) => {
+    const di = rows.findIndex((x) => x.meet_key === defaultMeetKey);
+    if (di <= 0) return rows;
+    const next = [...rows];
+    const [d] = next.splice(di, 1);
+    return [d, ...next];
+  };
+
+  return MEET_PICKER_TIME_SECTIONS.map(({ key, label }) => {
+    let rows = [...buckets[key]];
+    if (key === "upcoming") {
+      rows.sort((a, b) => mvpMeetSortTimestamp(a) - mvpMeetSortTimestamp(b));
+    } else {
+      rows.sort((a, b) => mvpMeetSortTimestamp(b) - mvpMeetSortTimestamp(a));
+    }
+    rows = pinDefaultFirst(rows);
+    return { key, label, meets: rows };
+  }).filter((s) => s.meets.length > 0);
 }
 
 function sortLevelOptions(levelValues: string[]): string[] {
@@ -67,6 +123,19 @@ function sortLevelOptions(levelValues: string[]): string[] {
   return [...numeric.map((n) => n.value), ...letters];
 }
 
+function inferMvpCategory(teamLevel: string | null | undefined, teamDivision: string | null | undefined): string {
+  const both = `${teamLevel ?? ""} ${teamDivision ?? ""}`.toLowerCase();
+  if (both.includes("cheerabilities")) return "CheerAbilities";
+  if (both.includes("novice")) return "Novice";
+  if (both.includes("rec")) return "Rec";
+  if (both.includes("prep")) return "Prep";
+  const levelMatch = /\blevel\s*([0-9]+)\b/i.exec(`${teamLevel ?? ""} ${teamDivision ?? ""}`);
+  if (levelMatch) return `Level ${levelMatch[1]}`;
+  const lMatch = /\bl\s*([0-9]+)\b/i.exec(`${teamLevel ?? ""} ${teamDivision ?? ""}`);
+  if (lMatch) return `Level ${lMatch[1]}`;
+  return "Other";
+}
+
 function statusTone(
   status: string,
   finalScore: number | null | undefined
@@ -80,9 +149,7 @@ function statusTone(
 }
 
 function resultRankCardClass(rank: number | null): string {
-  if (rank === 1) return "border-amber-200 bg-[var(--medal-gold-bg)]";
-  if (rank === 2) return "border-slate-300 bg-[var(--medal-silver-bg)]";
-  if (rank === 3) return "border-orange-200 bg-[var(--medal-bronze-bg)]";
+  if (rank === 1 || rank === 2 || rank === 3) return "border-slate-200 bg-white";
   return "border-slate-200 bg-white";
 }
 
@@ -97,11 +164,13 @@ function matchesMvpResultRowFilters(
   r: MvpResultRow,
   sid: number | null,
   levelFilter: string,
-  gymFilter: string
+  gymFilter: string,
+  categoryFilter: string
 ): boolean {
   if (sid != null && r.session_id !== sid) return false;
   if (RESTORE_LEVEL_FILTER && levelFilter !== "All" && (r.team_level ?? "") !== levelFilter) return false;
   if (!mvpGymMatches(gymFilter, r.team_gym_name)) return false;
+  if (categoryFilter !== "All" && inferMvpCategory(r.team_level, r.team_division) !== categoryFilter) return false;
   return true;
 }
 
@@ -124,17 +193,25 @@ function ChevronDown({ className }: { className?: string }) {
   );
 }
 
+function mvpFeedbackHelpfulDismissStorageKey(meetKey: string) {
+  return `cheer-mvp-feedback-helpful-dismissed-${meetKey}`;
+}
+
 export function MvpDashboard() {
   const [meetList, setMeetList] = useState<MvpMeetHit[]>([]);
   const [meetsErr, setMeetsErr] = useState<string | null>(null);
   const [meetStateFilter, setMeetStateFilter] = useState("All");
   const [activeMeetKey, setActiveMeetKey] = useState(DEFAULT_MEET_KEY);
+  const [meetPickerOpen, setMeetPickerOpen] = useState(false);
+  const [meetSearch, setMeetSearch] = useState("");
+  const meetPickerRef = useRef<HTMLDivElement>(null);
 
   const [sessionId, setSessionId] = useState<number | "">("");
   const [level, setLevel] = useState("All");
-  const [gym, setGym] = useState("All");
+  const [gym, setGym] = useState(MVP_DEFAULT_GYM_FILTER);
   const [team, setTeam] = useState("All");
-  const [tab, setTab] = useState<"timeline" | "results">("timeline");
+  const [category, setCategory] = useState("All");
+  const [tab, setTab] = useState<"timeline" | "results">("results");
   const [resultsRoundTab, setResultsRoundTab] = useState<MvpResultsRoundTab>("finals");
 
   const [timeline, setTimeline] = useState<MvpTimelineResponse | null>(null);
@@ -144,16 +221,18 @@ export function MvpDashboard() {
   const [errT, setErrT] = useState<string | null>(null);
   const [errR, setErrR] = useState<string | null>(null);
 
-  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
-  const [isIos, setIsIos] = useState(false);
-  const [isStandalone, setIsStandalone] = useState(false);
-  const [hideInstallHint, setHideInstallHint] = useState(false);
+  const [contextualFeedbackDismissed, setContextualFeedbackDismissed] = useState(false);
+  const [autoRefreshLiveScores, setAutoRefreshLiveScores] = useState(true);
+  const activeMeetKeyRef = useRef(activeMeetKey);
+  activeMeetKeyRef.current = activeMeetKey;
+  const resultsRoundTabInitializedRef = useRef(false);
 
   useLayoutEffect(() => {
+    resultsRoundTabInitializedRef.current = false;
     setSessionId("");
     setLevel("All");
-    setGym("All");
-    setTeam("All");
+    setGym(MVP_DEFAULT_GYM_FILTER);
+    setCategory("All");
     setTimeline(null);
     setAllResults([]);
     setErrT(null);
@@ -161,6 +240,7 @@ export function MvpDashboard() {
     setLoadingT(true);
     setLoadingR(true);
     setResultsRoundTab("finals");
+    setTab("results");
   }, [activeMeetKey]);
 
   useEffect(() => {
@@ -169,10 +249,25 @@ export function MvpDashboard() {
   }, [timeline]);
 
   useEffect(() => {
-    if (allResults.length === 0) return;
-    if (!allResults.some(mvpResultIsFinalsRound)) setResultsRoundTab("prelims");
-  }, [activeMeetKey, allResults]);
+    if (typeof window === "undefined") return;
+    try {
+      const k = mvpFeedbackHelpfulDismissStorageKey(activeMeetKey);
+      setContextualFeedbackDismissed(window.localStorage.getItem(k) === "1");
+    } catch {
+      setContextualFeedbackDismissed(false);
+    }
+  }, [activeMeetKey]);
 
+  const dismissContextualFeedbackHelpful = useCallback(() => {
+    try {
+      window.localStorage.setItem(mvpFeedbackHelpfulDismissStorageKey(activeMeetKey), "1");
+    } catch {
+      /* ignore */
+    }
+    setContextualFeedbackDismissed(true);
+  }, [activeMeetKey]);
+
+  /** Full meet catalog for the picker; gym filter only narrows schedule/results, not this list. */
   useEffect(() => {
     let cancelled = false;
     setMeetsErr(null);
@@ -191,56 +286,6 @@ export function MvpDashboard() {
       cancelled = true;
     };
   }, []);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const nav = window.navigator as Navigator & { standalone?: boolean };
-    const ios = /iphone|ipad|ipod/i.test(nav.userAgent);
-    const standalone =
-      window.matchMedia("(display-mode: standalone)").matches || Boolean(nav.standalone);
-    const previouslyInstalled = window.localStorage.getItem("cheer-mvp-installed") === "1";
-    setIsIos(ios);
-    setIsStandalone(standalone);
-    setHideInstallHint(previouslyInstalled || standalone);
-
-    if ("serviceWorker" in nav) {
-      if (process.env.NODE_ENV === "production") {
-        void nav.serviceWorker.register("/sw.js");
-      } else {
-        void nav.serviceWorker.getRegistrations().then((regs) => {
-          regs.forEach((reg) => void reg.unregister());
-        });
-        if ("caches" in window) {
-          void caches.keys().then((keys) => {
-            keys.forEach((key) => void caches.delete(key));
-          });
-        }
-      }
-    }
-
-    const onBeforeInstallPrompt = (event: Event) => {
-      event.preventDefault();
-      setDeferredInstallPrompt(event as BeforeInstallPromptEvent);
-    };
-    const onInstalled = () => {
-      setDeferredInstallPrompt(null);
-      setIsStandalone(true);
-      setHideInstallHint(true);
-      window.localStorage.setItem("cheer-mvp-installed", "1");
-    };
-    window.addEventListener("beforeinstallprompt", onBeforeInstallPrompt);
-    window.addEventListener("appinstalled", onInstalled);
-    return () => {
-      window.removeEventListener("beforeinstallprompt", onBeforeInstallPrompt);
-      window.removeEventListener("appinstalled", onInstalled);
-    };
-  }, []);
-
-  const onInstallClick = useCallback(async () => {
-    if (!deferredInstallPrompt) return;
-    await deferredInstallPrompt.prompt();
-    setDeferredInstallPrompt(null);
-  }, [deferredInstallPrompt]);
 
   useEffect(() => {
     let cancelled = false;
@@ -297,7 +342,6 @@ export function MvpDashboard() {
       const s = inferStateFromLocation(m.location);
       if (s) states.add(s);
     }
-    states.add(DEFAULT_MEET_STATE);
     return [...states].sort((a, b) => a.localeCompare(b));
   }, [meetList]);
 
@@ -307,18 +351,56 @@ export function MvpDashboard() {
         ? meetList
         : meetList.filter((m) => inferStateFromLocation(m.location) === meetStateFilter);
     if (filtered.some((m) => m.meet_key === DEFAULT_MEET_KEY)) return filtered;
-    const showSynthetic =
-      meetStateFilter === "All" || meetStateFilter.toUpperCase() === DEFAULT_MEET_STATE.toUpperCase();
-    if (!showSynthetic) return filtered;
+    if (meetStateFilter !== "All") return filtered;
     const synthetic: MvpMeetHit = {
       meet_key: DEFAULT_MEET_KEY,
       name: DEFAULT_MEET_LABEL,
-      location: `Atlanta, ${DEFAULT_MEET_STATE}`,
+      location: null,
       start_date: null,
       end_date: null,
     };
     return [synthetic, ...filtered];
   }, [meetList, meetStateFilter]);
+
+  const meetPickerFiltered = useMemo(() => {
+    const q = meetSearch.trim().toLowerCase();
+    if (!q) return meetPickerOptions;
+    return meetPickerOptions.filter((m) => {
+      const label = mvpMeetPickerLabel(m).toLowerCase();
+      const key = m.meet_key.toLowerCase();
+      const loc = (m.location ?? "").toLowerCase();
+      return label.includes(q) || key.includes(q) || loc.includes(q);
+    });
+  }, [meetPickerOptions, meetSearch]);
+
+  const meetPickerSections = useMemo(
+    () => buildMeetPickerTimeSections(meetPickerFiltered, DEFAULT_MEET_KEY),
+    [meetPickerFiltered]
+  );
+
+  useEffect(() => {
+    if (!meetPickerOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (meetPickerRef.current && !meetPickerRef.current.contains(e.target as Node)) {
+        setMeetPickerOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [meetPickerOpen]);
+
+  useEffect(() => {
+    if (!meetPickerOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMeetPickerOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [meetPickerOpen]);
+
+  useEffect(() => {
+    if (!meetPickerOpen) setMeetSearch("");
+  }, [meetPickerOpen]);
 
   useEffect(() => {
     if (meetPickerOptions.length === 0) return;
@@ -328,6 +410,41 @@ export function MvpDashboard() {
   }, [meetPickerOptions, activeMeetKey]);
 
   const selectedMeetInList = meetPickerOptions.some((m) => m.meet_key === activeMeetKey);
+
+  const meetPickerTriggerLabel = useMemo(() => {
+    if (!selectedMeetInList) return null;
+    const m = meetPickerOptions.find((x) => x.meet_key === activeMeetKey);
+    return m ? mvpMeetPickerLabel(m) : null;
+  }, [selectedMeetInList, meetPickerOptions, activeMeetKey]);
+
+  const meetHitForSchedule = useMemo(
+    () => meetList.find((m) => m.meet_key === activeMeetKey) ?? null,
+    [meetList, activeMeetKey]
+  );
+
+  const scheduleToneResolved = useMemo((): "live" | "upcoming" | "past" | null => {
+    if (timeline?.meet) return getMvpMeetScheduleStatus(timeline.meet).tone;
+    if (meetHitForSchedule) {
+      return getMvpMeetScheduleStatus(meetHitForSchedule as MvpMeetSummary).tone;
+    }
+    return null;
+  }, [timeline?.meet, meetHitForSchedule]);
+
+  const sid = sessionId === "" ? null : sessionId;
+
+  /**
+   * Gym in the dropdown is always ``gym``. For **past** meets only, after results are loaded,
+   * if no row in the meet is from that gym, widen to All so the list is not blank (dropdown
+   * still shows the user’s gym). While loading or when results are still empty, keep ``gym`` so
+   * we do not flash “all gyms” or a false “no rows for your gym” message.
+   */
+  const filterGym = useMemo(() => {
+    if (gym === "All") return gym;
+    if (scheduleToneResolved !== "past") return gym;
+    if (loadingR || allResults.length === 0) return gym;
+    const hasRowsForGym = allResults.some((r) => mvpGymMatches(gym, r.team_gym_name));
+    return hasRowsForGym ? gym : "All";
+  }, [scheduleToneResolved, gym, allResults, loadingR]);
 
   const optionSourceRows = useMemo(() => {
     type Row = {
@@ -363,21 +480,24 @@ export function MvpDashboard() {
     return ["All", ...sortLevelOptions(raw).filter(notSentinelAll)];
   }, [optionSourceRows]);
 
-  const gyms = useMemo(() => {
-    const rest = [
-      ...new Set(optionSourceRows.map((i) => i.team_gym_name).filter(Boolean) as string[]),
-    ]
-      .map((g) => g.trim())
-      .filter(Boolean)
-      .filter(notSentinelAll)
-      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-    return ["All", ...rest];
-  }, [optionSourceRows]);
+  /** Gym dropdown: only gyms that appear on the loaded meet (timeline + results), plus current filter if set. */
+  const gymPickerOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const i of optionSourceRows) {
+      const gn = (i.team_gym_name ?? "").trim();
+      if (gn && notSentinelAll(gn)) set.add(gn);
+    }
+    if (gym !== "All" && gym.trim()) set.add(gym.trim());
+    return ["All", ...[...set].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }))];
+  }, [optionSourceRows, gym]);
 
   const teamOptionRows = useMemo(() => {
-    if (gym === "All") return optionSourceRows;
-    return optionSourceRows.filter((i) => mvpGymMatches(gym, i.team_gym_name));
-  }, [optionSourceRows, gym]);
+    return optionSourceRows.filter((i) => {
+      if (filterGym !== "All" && !mvpGymMatches(filterGym, i.team_gym_name)) return false;
+      if (category !== "All" && inferMvpCategory(i.team_level, i.team_division) !== category) return false;
+      return true;
+    });
+  }, [optionSourceRows, filterGym, category]);
 
   const teams = useMemo(() => {
     const rest = [
@@ -388,12 +508,42 @@ export function MvpDashboard() {
     return ["All", ...rest];
   }, [teamOptionRows]);
 
+  const categories = useMemo(() => {
+    const fixedPrefix = ["CheerAbilities", "Novice", "Rec", "Prep"];
+    const rowsForCategories =
+      filterGym === "All"
+        ? optionSourceRows
+        : optionSourceRows.filter((r) => mvpGymMatches(filterGym, r.team_gym_name));
+    const present = new Set<string>();
+    for (const r of rowsForCategories) {
+      present.add(inferMvpCategory(r.team_level, r.team_division));
+    }
+    const levelNums = new Set<number>();
+    for (const c of present) {
+      const m = /^Level (\d+)$/.exec(c);
+      if (m) levelNums.add(Number(m[1]));
+    }
+    const levelLabels = [...levelNums].sort((a, b) => a - b).map((n) => `Level ${n}`);
+
+    const out: string[] = ["All"];
+    for (const c of fixedPrefix) {
+      if (present.has(c)) out.push(c);
+    }
+    for (const c of levelLabels) {
+      if (present.has(c)) out.push(c);
+    }
+    if (present.has("Other")) out.push("Other");
+    return out;
+  }, [optionSourceRows, filterGym]);
+
+  useLayoutEffect(() => {
+    if (category !== "All" && !categories.includes(category)) setCategory("All");
+  }, [categories, category]);
+
   useLayoutEffect(() => {
     if (team === "All") return;
     if (!teams.includes(team)) setTeam("All");
-  }, [gym, teams, team]);
-
-  const sid = sessionId === "" ? null : sessionId;
+  }, [filterGym, category, teams, team]);
 
   const filteredTimelineItems: MvpTimelineItem[] = useMemo(() => {
     const items = timeline?.items ?? [];
@@ -403,14 +553,17 @@ export function MvpDashboard() {
       }
       if (sid != null && row.session_id !== sid) return false;
       if (RESTORE_LEVEL_FILTER && level !== "All" && (row.team_level ?? "") !== level) return false;
-      if (!mvpGymMatches(gym, row.team_gym_name)) return false;
+      if (!mvpGymMatches(filterGym, row.team_gym_name)) return false;
+      if (category !== "All" && inferMvpCategory(row.team_level, row.team_division) !== category) return false;
       if (team !== "All" && (row.team_name ?? "") !== team) return false;
       return true;
     });
-  }, [timeline, sid, level, gym, team]);
+  }, [timeline, sid, level, filterGym, category, team]);
 
   const divisionFilteredResults: MvpResultRow[] = useMemo(() => {
-    const narrowContext = allResults.filter((r) => matchesMvpResultRowFilters(r, sid, level, gym));
+    const narrowContext = allResults.filter((r) =>
+      matchesMvpResultRowFilters(r, sid, level, filterGym, category)
+    );
     if (team === "All") return narrowContext;
 
     // Anchors respect gym (and session/level) so "Gym X + Team Y" finds the right division.
@@ -419,14 +572,38 @@ export function MvpDashboard() {
 
     const buckets = new Set(anchors.map((r) => mvpResultDivisionBucketKey(r)));
     // Full standings: every team in that session/level/division, not only the selected gym.
-    const widePool = allResults.filter((r) => matchesMvpResultRowFilters(r, sid, level, "All"));
+    const widePool = allResults.filter((r) =>
+      matchesMvpResultRowFilters(r, sid, level, "All", category)
+    );
     return widePool.filter((r) => buckets.has(mvpResultDivisionBucketKey(r)));
-  }, [allResults, sid, level, gym, team]);
+  }, [allResults, sid, level, filterGym, category, team]);
 
   const filteredResults: MvpResultRow[] = useMemo(
     () => filterMvpResultsByRoundTab(divisionFilteredResults, resultsRoundTab),
     [divisionFilteredResults, resultsRoundTab]
   );
+
+  const { hasFinals: hasFinalsRoundScores, hasPrelims: hasPrelimsRoundScores } = useMemo(
+    () => mvpResultsRoundAvailability(divisionFilteredResults),
+    [divisionFilteredResults]
+  );
+  const showResultsRoundPills = hasFinalsRoundScores && hasPrelimsRoundScores;
+
+  useEffect(() => {
+    if (allResults.length > 0 && !resultsRoundTabInitializedRef.current) {
+      setResultsRoundTab(mvpSuggestResultsRoundTab(allResults));
+      resultsRoundTabInitializedRef.current = true;
+    }
+  }, [allResults]);
+
+  useEffect(() => {
+    if (!hasFinalsRoundScores && hasPrelimsRoundScores && resultsRoundTab === "finals") {
+      setResultsRoundTab("prelims");
+    }
+    if (hasFinalsRoundScores && !hasPrelimsRoundScores && resultsRoundTab === "prelims") {
+      setResultsRoundTab("finals");
+    }
+  }, [hasFinalsRoundScores, hasPrelimsRoundScores, resultsRoundTab]);
 
   const displayTimelineItems = useMemo(
     () => dedupeMvpTimelineItems(filteredTimelineItems),
@@ -435,7 +612,8 @@ export function MvpDashboard() {
   const displayResultRows = useMemo(() => {
     const deduped = dedupeMvpResultRows(filteredResults);
     if (team === "All") return deduped;
-    return withSequentialResultRanks(deduped);
+    // Full division standings: keep Varsity ranks; only sort for display order.
+    return sortMvpResultsStandings(deduped);
   }, [filteredResults, team]);
 
   const meetInfo = timeline?.meet;
@@ -447,21 +625,75 @@ export function MvpDashboard() {
     DEFAULT_MEET_LABEL
   );
   const scheduleStatus = getMvpMeetScheduleStatus(meetInfo ?? null);
-  const headerLocationLine = (meetInfo?.location ?? "").trim() || null;
-  const headerDateRangeLine = formatMvpMeetDateRangeReadable(meetInfo);
+  const canAutoRefreshLive = Boolean(timeline) && scheduleStatus.tone === "live";
+  const meetStartsReadable = formatMvpMeetStartsAtReadable(meetInfo ?? null);
+  const selectedMeetSummary = useMemo(
+    () => meetPickerOptions.find((m) => m.meet_key === activeMeetKey) ?? null,
+    [meetPickerOptions, activeMeetKey]
+  );
+  const searchListMeet = useMemo(
+    () => meetList.find((m) => m.meet_key === activeMeetKey) ?? null,
+    [meetList, activeMeetKey]
+  );
+  const headerLocationLine = mvpCoalesceMeetLocation(
+    activeMeetKey,
+    meetInfo?.location,
+    selectedMeetSummary?.location,
+    searchListMeet?.location
+  );
+  const headerDateRangeLine =
+    formatMvpMeetDateRangeReadable(meetInfo) ||
+    formatMvpMeetDateRangeReadable(selectedMeetSummary) ||
+    formatMvpMeetDateRangeReadable(searchListMeet);
   const showTimelineTab = mvpMeetShowsTimelineTab(meetInfo);
+  const varsityScheduleUrl = useMemo(
+    () => varsityOfficialScheduleUrlForMeetKey(activeMeetKey),
+    [activeMeetKey]
+  );
+
+  useEffect(() => {
+    if (varsityScheduleUrl && tab === "timeline") setTab("results");
+  }, [varsityScheduleUrl, tab, activeMeetKey]);
+
+  const refreshLiveMvpData = useCallback(async () => {
+    const key = activeMeetKeyRef.current;
+    const [tlRes, rRes] = await Promise.allSettled([
+      mvpTimeline(key, null),
+      mvpResults(key, null),
+    ]);
+    if (activeMeetKeyRef.current !== key) return;
+    if (tlRes.status === "fulfilled") setTimeline(tlRes.value);
+    if (rRes.status === "fulfilled") setAllResults(rRes.value.results);
+  }, []);
+
+  useMvpLiveAutoRefresh(autoRefreshLiveScores, canAutoRefreshLive, refreshLiveMvpData);
 
   const loading = tab === "timeline" ? loadingT : loadingR;
   const err = tab === "timeline" ? errT : errR;
 
   return (
     <div className="mx-auto max-w-lg px-4 pb-16 pt-6">
-      <header className="rounded-2xl bg-gradient-to-br from-[var(--brand)] via-[#003d52] to-[var(--brand-bright)] px-4 py-4 text-white shadow-lg">
-        <div className="flex items-start justify-between gap-3">
+      <header className="relative overflow-hidden rounded-2xl border border-lime-300/40 bg-gradient-to-r from-sky-500 via-cyan-300 to-teal-200 px-4 py-3 text-white shadow-lg shadow-black/10 ring-1 ring-white/10">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 bg-gradient-to-r from-black/24 via-black/10 to-black/28"
+        />
+        <div className="relative z-10 flex items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
-            <h1 className="text-base font-bold uppercase leading-tight tracking-wide">{headerNameLine}</h1>
+            <h1 className="text-base font-semibold uppercase leading-tight tracking-wide text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.55)]">
+              {headerNameLine}
+            </h1>
             {!meetInfo && !loadingT && (
-              <p className="mt-1 text-sm opacity-75">Select a competition below</p>
+              <p className="mt-1 text-sm text-white/90 drop-shadow-[0_1px_1px_rgba(0,0,0,0.45)]">
+                Select a competition below
+              </p>
+            )}
+            {(headerLocationLine || headerDateRangeLine) && (
+              <p className="mt-1.5 truncate text-xs font-medium text-white/90 drop-shadow-[0_1px_2px_rgba(0,0,0,0.45)]">
+                {headerLocationLine}
+                {headerLocationLine && headerDateRangeLine ? " · " : ""}
+                {headerDateRangeLine}
+              </p>
             )}
           </div>
           {meetInfo && scheduleStatus.tone !== "past" && (
@@ -476,96 +708,20 @@ export function MvpDashboard() {
             </span>
           )}
         </div>
-        {(headerLocationLine || headerDateRangeLine) && (
-          <div className="mt-3 flex items-start justify-between gap-4 border-t border-white/20 pt-3 text-sm leading-snug">
-            <div className="min-w-0 flex-1 text-white/90">
-              {headerLocationLine ? <p>{headerLocationLine}</p> : null}
-            </div>
-            {headerDateRangeLine && (
-              <p className="max-w-[58%] shrink-0 text-right font-medium text-white">{headerDateRangeLine}</p>
-            )}
-          </div>
-        )}
       </header>
 
-      <div className="mt-4 rounded-2xl bg-[var(--card)] p-3 shadow-sm ring-1 ring-slate-200/80">
-        {!isStandalone && !hideInstallHint && (
-          <div className="mb-3 rounded-xl border border-slate-200 bg-slate-50 p-2.5 text-xs text-slate-700">
-            {deferredInstallPrompt ? (
-              <div className="flex items-center justify-between gap-2">
-                <span>Install this app on your home screen for quick access.</span>
-                <button
-                  type="button"
-                  onClick={() => void onInstallClick()}
-                  className="shrink-0 rounded-full bg-[var(--accent)] px-3 py-1.5 text-xs font-bold text-[var(--accent-foreground)]"
-                >
-                  Add app
-                </button>
-              </div>
-            ) : isIos ? (
-              <div className="space-y-1">
-                <p className="font-semibold text-slate-900">Install on iPhone:</p>
-                <p>
-                  Tap Share, then <strong>Add to Home Screen</strong>.
-                </p>
-              </div>
-            ) : (
-              <p>Tip: add this site to your home screen for quick access.</p>
-            )}
-          </div>
-        )}
+      <MvpInstallHintBanner />
 
+      <MvpAboutBanner />
+
+      <div className="mt-4 rounded-2xl bg-[var(--card)] p-3 shadow-sm ring-1 ring-slate-200/80">
         {meetsErr && (
           <p className="mb-2 rounded-lg bg-amber-50 px-2 py-1.5 text-xs text-amber-900">{meetsErr}</p>
         )}
 
-        <div className="mb-2 flex items-end gap-2">
-          <label className="flex min-w-0 flex-1 flex-col gap-1 text-xs font-medium text-slate-700">
-            <span>Meet</span>
-            <div className="relative w-full">
-              <select
-                value={activeMeetKey}
-                onChange={(e) => setActiveMeetKey(e.target.value)}
-                className="mvp-select"
-              >
-                {!selectedMeetInList && (
-                  <option value={activeMeetKey}>
-                    {meetPickerFallbackTitle}
-                  </option>
-                )}
-                {meetPickerOptions.map((m) => (
-                  <option key={m.meet_key} value={m.meet_key}>
-                    {mvpMeetPickerLabel(m)}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-3 w-3 -translate-y-1/2 text-slate-500" />
-            </div>
-          </label>
-          <label className="flex w-[5.25rem] shrink-0 flex-col gap-1 text-xs font-medium text-slate-700 sm:w-24">
-            <span>State</span>
-            <div className="relative w-full">
-              <select
-                value={meetStateFilter}
-                onChange={(e) => setMeetStateFilter(e.target.value)}
-                className="mvp-select mvp-select-sm"
-                title="Filter meets by state"
-              >
-                <option value="All">All states</option>
-                {meetStatesForPicker.map((s) => (
-                  <option key={s} value={s}>
-                    {s}
-                  </option>
-                ))}
-              </select>
-              <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-2.5 w-2.5 -translate-y-1/2 text-slate-500" />
-            </div>
-          </label>
-        </div>
-
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+        <div className="mb-2 grid grid-cols-3 gap-1.5 sm:gap-2">
           {RESTORE_SESSION_FILTER && (
-            <label className="flex flex-col gap-1 text-xs font-medium text-slate-700">
+            <label className="flex min-w-0 flex-col gap-1 text-xs font-medium text-slate-700">
               <span>Session</span>
               <div className="relative">
                 <select
@@ -588,7 +744,7 @@ export function MvpDashboard() {
             </label>
           )}
           {RESTORE_LEVEL_FILTER && (
-            <label className="flex flex-col gap-1 text-xs font-medium text-slate-700">
+            <label className="flex min-w-0 flex-col gap-1 text-xs font-medium text-slate-700">
               <span>Level</span>
               <div className="relative">
                 <select
@@ -606,15 +762,33 @@ export function MvpDashboard() {
               </div>
             </label>
           )}
-          <label className="flex flex-col gap-1 text-xs font-medium text-slate-700">
+          <label className="flex min-w-0 flex-col gap-1 text-xs font-medium text-slate-700">
+            <span>Category</span>
+            <div className="relative min-w-0">
+              <select
+                value={category}
+                onChange={(e) => setCategory(e.target.value)}
+                className="mvp-select mvp-select-sm min-w-0"
+              >
+                {categories.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-2.5 w-2.5 -translate-y-1/2 text-slate-500" />
+            </div>
+          </label>
+          <label className="flex min-w-0 flex-col gap-1 text-xs font-medium text-slate-700">
             <span>Gym</span>
-            <div className="relative">
+            <div className="relative min-w-0">
               <select
                 value={gym}
                 onChange={(e) => setGym(e.target.value)}
-                className="mvp-select mvp-select-sm"
+                className="mvp-select mvp-select-sm min-w-0"
+                title="Filter schedule and results by gym (only gyms in this competition). Persists when you change meets. For past meets with no rows for your gym, results temporarily show all teams."
               >
-                {gyms.map((g) => (
+                {gymPickerOptions.map((g) => (
                   <option key={g} value={g}>
                     {g}
                   </option>
@@ -623,13 +797,13 @@ export function MvpDashboard() {
               <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-2.5 w-2.5 -translate-y-1/2 text-slate-500" />
             </div>
           </label>
-          <label className="col-span-2 flex flex-col gap-1 text-xs font-medium text-slate-700 sm:col-span-1">
+          <label className="flex min-w-0 flex-col gap-1 text-xs font-medium text-slate-700">
             <span>Team</span>
-            <div className="relative">
+            <div className="relative min-w-0">
               <select
                 value={team}
                 onChange={(e) => setTeam(e.target.value)}
-                className="mvp-select mvp-select-sm"
+                className="mvp-select mvp-select-sm min-w-0"
               >
                 {teams.map((t) => (
                   <option key={t} value={t}>
@@ -642,64 +816,169 @@ export function MvpDashboard() {
           </label>
         </div>
 
-        <div className="mt-3 overflow-hidden rounded-2xl border border-slate-200 bg-slate-100/90 shadow-sm ring-1 ring-slate-200/60">
-          {showTimelineTab ? (
-            <div className="flex gap-1 p-1">
+        {filterGym !== gym && !loadingR && allResults.length > 0 && (
+          <p className="mb-2 text-xs leading-snug text-slate-600">
+            No results for <span className="font-medium text-slate-800">{gym}</span> in this meet;
+            showing all teams. Your gym filter is unchanged for the next competition.
+          </p>
+        )}
+
+        <div className="mb-2 flex items-end gap-2">
+          <div className="flex min-w-0 flex-1 flex-col gap-1">
+            <span id="mvp-meet-field-label" className="text-xs font-medium text-slate-700">
+              Meet
+            </span>
+            <div ref={meetPickerRef} className="relative w-full">
               <button
                 type="button"
-                onClick={() => setTab("timeline")}
-                className={`flex-1 rounded-full py-2 text-xs font-bold uppercase tracking-wide ${
-                  tab === "timeline"
-                    ? "bg-[var(--accent)] text-[var(--accent-foreground)] shadow-sm"
-                    : "text-[var(--muted)]"
-                }`}
+                id="mvp-meet-picker-trigger"
+                aria-haspopup="listbox"
+                aria-expanded={meetPickerOpen}
+                aria-controls="mvp-meet-picker-listbox"
+                aria-labelledby="mvp-meet-field-label"
+                onClick={() => setMeetPickerOpen((o) => !o)}
+                className="mvp-select flex w-full items-center justify-between gap-2 text-left"
               >
-                Timeline
+                <span className="min-w-0 flex-1 truncate">
+                  {meetPickerTriggerLabel ?? meetPickerFallbackTitle}
+                </span>
+                <ChevronDown className="pointer-events-none h-3 w-3 shrink-0 text-slate-500" />
               </button>
-              <button
-                type="button"
-                onClick={() => setTab("results")}
-                className={`flex-1 rounded-full py-2 text-xs font-bold uppercase tracking-wide ${
-                  tab === "results"
-                    ? "bg-[var(--accent)] text-[var(--accent-foreground)] shadow-sm"
-                    : "text-[var(--muted)]"
-                }`}
-              >
-                Results
-              </button>
+              {meetPickerOpen && (
+                <div
+                  id="mvp-meet-picker-listbox"
+                  role="listbox"
+                  aria-labelledby="mvp-meet-picker-trigger"
+                  className="absolute left-0 right-0 top-full z-50 mt-1 max-h-[min(22rem,70vh)] overflow-hidden rounded-xl border border-slate-200 bg-white py-1 shadow-lg ring-1 ring-black/5"
+                >
+                  <div className="border-b border-slate-100 px-2 pb-2 pt-1">
+                    <input
+                      type="search"
+                      value={meetSearch}
+                      onChange={(e) => setMeetSearch(e.target.value)}
+                      placeholder="Search name, state, or id — finds future meets too"
+                      className="w-full rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-sm text-slate-900 outline-none ring-[var(--brand)] placeholder:text-slate-400 focus:border-slate-300 focus:bg-white focus:ring-2"
+                      autoComplete="off"
+                      autoFocus
+                    />
+                  </div>
+                  <ul className="max-h-60 overflow-y-auto px-1 pb-1">
+                    {!selectedMeetInList && (
+                      <li>
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={true}
+                          className="w-full rounded-lg px-2 py-2 text-left text-sm text-slate-800"
+                          onMouseDown={(e) => e.preventDefault()}
+                          onClick={() => setMeetPickerOpen(false)}
+                        >
+                          {meetPickerFallbackTitle}
+                        </button>
+                      </li>
+                    )}
+                    {meetPickerFiltered.length === 0 ? (
+                      <li className="px-2 py-3 text-center text-sm text-slate-500">No matches</li>
+                    ) : (
+                      <>
+                        {meetPickerSections.map((g) => (
+                          <Fragment key={g.key}>
+                            <li
+                              role="presentation"
+                              className="sticky top-0 z-[1] border-b border-slate-100 bg-slate-50/95 px-2 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-slate-500 backdrop-blur-sm"
+                            >
+                              {g.label}
+                            </li>
+                            {g.meets.map((m) => {
+                              const selected = m.meet_key === activeMeetKey;
+                              return (
+                                <li key={m.meet_key}>
+                                  <button
+                                    type="button"
+                                    role="option"
+                                    aria-selected={selected}
+                                    className={`w-full rounded-lg px-2 py-2 text-left text-sm ${
+                                      selected
+                                        ? "bg-sky-100 font-semibold text-slate-900"
+                                        : "text-slate-800 hover:bg-slate-50"
+                                    }`}
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={() => {
+                                      setMeetPickerOpen(false);
+                                      setActiveMeetKey(m.meet_key);
+                                    }}
+                                  >
+                                    {mvpMeetPickerLabel(m)}
+                                  </button>
+                                </li>
+                              );
+                            })}
+                          </Fragment>
+                        ))}
+                      </>
+                    )}
+                  </ul>
+                </div>
+              )}
             </div>
-          ) : (
-            <div
-              className="bg-[var(--accent)] px-3 py-2 text-center text-xs font-bold uppercase tracking-wide text-[var(--accent-foreground)]"
-              role="status"
-            >
-              Results
+          </div>
+          <label className="flex w-[5.25rem] shrink-0 flex-col gap-1 text-xs font-medium text-slate-700 sm:w-24">
+            <span>State</span>
+            <div className="relative w-full">
+              <select
+                value={meetStateFilter}
+                onChange={(e) => setMeetStateFilter(e.target.value)}
+                className="mvp-select mvp-select-sm"
+                title="Filter meets by state"
+              >
+                <option value="All">All states</option>
+                {meetStatesForPicker.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+              <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-2.5 w-2.5 -translate-y-1/2 text-slate-500" />
             </div>
-          )}
-          {tab === "results" && (
-            <div className="flex gap-1 border-t border-slate-200/80 bg-slate-50/95 p-1">
-              <button
-                type="button"
-                onClick={() => setResultsRoundTab("finals")}
-                className={`flex-1 rounded-full py-1.5 text-[11px] font-bold uppercase tracking-wide ${
-                  resultsRoundTab === "finals"
-                    ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200"
-                    : "text-[var(--muted)]"
-                }`}
-              >
-                Finals
-              </button>
-              <button
-                type="button"
-                onClick={() => setResultsRoundTab("prelims")}
-                className={`flex-1 rounded-full py-1.5 text-[11px] font-bold uppercase tracking-wide ${
-                  resultsRoundTab === "prelims"
-                    ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200"
-                    : "text-[var(--muted)]"
-                }`}
-              >
-                Prelims
-              </button>
+          </label>
+        </div>
+
+        {canAutoRefreshLive && (
+          <label className="mb-2 mt-1 flex items-center gap-1.5 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={autoRefreshLiveScores}
+              onChange={(e) => setAutoRefreshLiveScores(e.target.checked)}
+              className="rounded"
+            />
+            Auto-refresh live scores
+          </label>
+        )}
+
+        <div className="mt-3 overflow-hidden rounded-xl border border-slate-200 bg-slate-100/90 shadow-sm ring-1 ring-slate-200/60">
+          <MvpMeetResultsScheduleTabs
+            meetKey={activeMeetKey}
+            tab={tab}
+            onTabChange={setTab}
+            showInAppTimelineTab={showTimelineTab}
+          />
+          {!showTimelineTab && tab === "results" && !varsityScheduleUrl && (
+            <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 bg-slate-50/95 px-3 py-2">
+              <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Results</h2>
+              <div className="flex flex-wrap items-center gap-2">
+                {showResultsRoundPills ? (
+                  <MvpResultsRoundPills
+                    value={resultsRoundTab}
+                    onChange={(v) => {
+                      resultsRoundTabInitializedRef.current = true;
+                      setResultsRoundTab(v);
+                    }}
+                  />
+                ) : null}
+                {!loadingR && (
+                  <p className="text-xs text-[var(--muted)]">{displayResultRows.length} teams</p>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -722,36 +1001,97 @@ export function MvpDashboard() {
               {displayTimelineItems.filter((i) => !i.is_break).length} routines
             </p>
           )}
-          {tab === "results" && !loadingR && (
-            <p className="mt-3 text-xs text-[var(--muted)]">{displayResultRows.length} teams</p>
+          {timeline && tab === "results" && (showTimelineTab || varsityScheduleUrl) && (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+              {showResultsRoundPills ? (
+                <MvpResultsRoundPills
+                  value={resultsRoundTab}
+                  onChange={(v) => {
+                    resultsRoundTabInitializedRef.current = true;
+                    setResultsRoundTab(v);
+                  }}
+                />
+              ) : null}
+              {!loadingR && (
+                <p className="text-xs text-[var(--muted)]">{displayResultRows.length} teams</p>
+              )}
+            </div>
           )}
+
+          {!loading &&
+            tab === "timeline" &&
+            timeline &&
+            displayTimelineItems.filter((i) => !i.is_break).length === 0 && (
+              <div className="mt-3 rounded-xl border border-sky-200 bg-sky-50/90 px-3 py-2.5 text-sm text-slate-800 shadow-sm">
+                {scheduleStatus.tone === "upcoming" ? (
+                  <>
+                    <p className="font-semibold text-slate-900">This competition hasn’t started yet</p>
+                    {meetStartsReadable && (
+                      <p className="mt-1 text-xs leading-snug text-slate-600">
+                        Scheduled: {meetStartsReadable}
+                      </p>
+                    )}
+                    <p className="mt-1.5 text-xs leading-snug text-slate-600">
+                      {varsityScheduleUrl ? (
+                        <>
+                          Use <span className="font-medium">Schedule</span> above for Varsity’s official schedule on the
+                          next screen.
+                        </>
+                      ) : (
+                        <>
+                          Open <span className="font-medium">Schedule</span> to see mat order when that data is
+                          available.
+                        </>
+                      )}
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <p className="font-semibold text-slate-900">No routine list in the feed yet</p>
+                    <p className="mt-1 text-xs leading-snug text-slate-600">
+                      We’re not seeing scored divisions or a published mat order for this meet in the Varsity
+                      results API. Check back after performances begin.
+                    </p>
+                  </>
+                )}
+              </div>
+            )}
 
           {!loading && tab === "timeline" && timeline && (
             <ol className="mt-2 space-y-2">
               {displayTimelineItems.map((row) => {
+                const when = mvpTimelineWhenDisplay(row);
                 if (row.is_break) {
                   return (
                     <li
                       key={row.performance_id}
                       className="flex items-center gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-sm text-[var(--muted)]"
                     >
-                      <span className="w-14 shrink-0 font-mono text-xs">{formatTime(row.scheduled_time)}</span>
+                      <span className="w-14 shrink-0 font-mono text-xs" title={when.title}>
+                        {when.text}
+                      </span>
                       <span>{row.break_label || "Break"}</span>
                     </li>
                   );
                 }
                 const st = statusTone(row.status, row.final_score);
                 const sessionLine = row.session_name?.trim() || "";
-                const extraMeta = [row.team_level, row.team_division, row.round].filter(Boolean).filter(
-                  (bit) => !sessionLine.toLowerCase().includes(String(bit).toLowerCase())
-                );
+                const extraLevelDiv = mvpResultRowMetaExtras(sessionLine, row.team_level, row.team_division);
+                const roundBit = row.round?.trim();
+                const extraMeta = [
+                  ...extraLevelDiv,
+                  ...(roundBit && !sessionLine.toLowerCase().includes(roundBit.toLowerCase()) ? [roundBit] : []),
+                ];
                 return (
                   <li
                     key={row.performance_id}
                     className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white px-3 py-3 shadow-sm"
                   >
-                    <div className="w-14 shrink-0 font-mono text-xs text-[var(--muted)]">
-                      {formatTime(row.scheduled_time)}
+                    <div
+                      className="w-14 shrink-0 font-mono text-xs text-[var(--muted)]"
+                      title={when.title}
+                    >
+                      {when.text}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
@@ -777,15 +1117,83 @@ export function MvpDashboard() {
           )}
 
           {!loading && tab === "results" && (
-            <ol className="mt-2 space-y-2">
+            <>
+              {TALLY_FEEDBACK_FORM_ID &&
+                !contextualFeedbackDismissed &&
+                !err &&
+                displayResultRows.length > 0 && (
+                  <div className="relative mt-2 rounded-lg border border-slate-200 bg-slate-50 py-2 pl-2.5 pr-9 text-[11px] leading-snug text-slate-600">
+                    <button
+                      type="button"
+                      onClick={() => dismissContextualFeedbackHelpful()}
+                      className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/80 hover:text-slate-800"
+                      aria-label="Dismiss"
+                    >
+                      <span className="text-lg leading-none" aria-hidden="true">
+                        ×
+                      </span>
+                    </button>
+                    <p>
+                      💬 Was this helpful? Tap{" "}
+                      <button
+                        type="button"
+                        onClick={() => openTallyFeedback()}
+                        className="font-semibold text-red-700 underline decoration-red-300 underline-offset-2 hover:text-red-800"
+                      >
+                        Feedback
+                      </button>{" "}
+                      (bottom right) — takes under a minute.
+                    </p>
+                  </div>
+                )}
+              <ol className="mt-2 space-y-2">
               {displayResultRows.length === 0 ? (
-                <p className="text-sm text-[var(--muted)]">No scored routines for this filter yet.</p>
+                allResults.length === 0 ? (
+                  <div className="rounded-xl border border-sky-200 bg-sky-50/90 px-3 py-2.5 text-sm text-slate-800 shadow-sm">
+                    <p className="font-semibold text-slate-900">No scores in the feed yet</p>
+                    <p className="mt-1 text-xs leading-snug text-slate-600">
+                      Scores appear here after Varsity publishes them for this meet.{" "}
+                      {showResultsRoundPills
+                        ? "If the event is running, try the Prelims pill—Finals can stay empty until those rounds post."
+                        : "If the event is running, check back as more rounds post."}
+                    </p>
+                    <p className="mt-1.5 text-xs leading-snug text-slate-600">
+                      {varsityScheduleUrl ? (
+                        <>
+                          Use <span className="font-medium">Schedule</span> above for Varsity’s official schedule on the
+                          next screen.
+                        </>
+                      ) : (
+                        <>
+                          Open <span className="font-medium">Schedule</span> to see mat order when that data is
+                          available.
+                        </>
+                      )}
+                    </p>
+                    {TALLY_FEEDBACK_FORM_ID ? (
+                      <p className="mt-3 text-xs text-slate-600">
+                        💬 Expecting scores here or something look wrong? Tap{" "}
+                        <button
+                          type="button"
+                          onClick={() => openTallyFeedback()}
+                          className="font-semibold text-sky-900 underline decoration-sky-400/60 underline-offset-2 hover:text-sky-950"
+                        >
+                          Feedback
+                        </button>
+                        .
+                      </p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="text-sm text-[var(--muted)]">
+                    No teams match the current gym, category, team, or round. Try All
+                    {showResultsRoundPills ? " or switch Finals / Prelims." : " or widen filters."}
+                  </p>
+                )
               ) : (
                 displayResultRows.map((r, idx) => {
                   const sessionLine = r.session_name?.trim() || "";
-                  const extras = [r.team_level, r.team_division].filter(Boolean).filter(
-                    (bit) => !sessionLine.toLowerCase().includes(String(bit).toLowerCase())
-                  );
+                  const extras = mvpResultRowMetaExtras(sessionLine, r.team_level, r.team_division);
                   const tagBits = [sessionLine || null, ...extras].filter(Boolean) as string[];
                   return (
                   <li key={`${r.team_name}-${r.session_id}-${idx}`} className="list-none">
@@ -818,6 +1226,12 @@ export function MvpDashboard() {
                             </span>
                           ))}
                         </div>
+                        {(() => {
+                          const cap = mvpResultRowScheduleCaption(r);
+                          return cap ? (
+                            <div className="mt-1 text-[10px] font-medium tabular-nums text-slate-600">{cap}</div>
+                          ) : null;
+                        })()}
                       </div>
                     </div>
                     <MvpResultScoreBreakdown r={r} />
@@ -827,6 +1241,7 @@ export function MvpDashboard() {
                 })
               )}
             </ol>
+            </>
           )}
         </>
       )}

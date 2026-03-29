@@ -12,11 +12,20 @@ export type MvpMeetHit = {
   location: string | null;
   start_date: string | null;
   end_date: string | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
 };
 
 export type MvpSearchResponse = {
   q: string;
   teams: MvpTeamHit[];
+  meets: MvpMeetHit[];
+  /** Distinct gyms that appear in scored performances (empty search only). */
+  gym_names?: string[];
+};
+
+export type MvpUpcomingMeetsResponse = {
+  limit: number;
   meets: MvpMeetHit[];
 };
 
@@ -27,6 +36,8 @@ export type MvpMeetSummary = {
   location: string | null;
   start_date: string | null;
   end_date: string | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
   source: string | null;
 };
 
@@ -74,6 +85,8 @@ export type MvpResultRow = {
   raw_score: number | null;
   performance_score: number | null;
   deductions: number | null;
+  scheduled_time: string | null;
+  actual_time: string | null;
   team_name: string;
   team_gym_name: string | null;
   team_level: string | null;

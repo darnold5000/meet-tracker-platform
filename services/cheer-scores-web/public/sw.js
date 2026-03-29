@@ -1,5 +1,22 @@
-const CACHE_NAME = "cheer-scores-shell-v1";
-const APP_SHELL = ["/", "/manifest.webmanifest", "/icon-192.png", "/icon-512.png", "/apple-touch-icon.png"];
+/** Bump this when shell assets (icons, manifest) change so clients drop stale cache. */
+const CACHE_NAME = "cheer-tracker-shell-v5";
+const ICON_QUERY = "?v=5";
+
+const APP_SHELL = [
+  "/",
+  `/manifest.webmanifest${ICON_QUERY}`,
+  `/icon-192.png${ICON_QUERY}`,
+  `/icon-512.png${ICON_QUERY}`,
+  `/apple-touch-icon.png${ICON_QUERY}`,
+];
+
+function isShellAssetUrl(url) {
+  const p = url.pathname;
+  if (p === "/manifest.webmanifest") return true;
+  if (p === "/apple-touch-icon.png") return true;
+  if (p.startsWith("/icon-") && p.endsWith(".png")) return true;
+  return false;
+}
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -35,6 +52,22 @@ self.addEventListener("fetch", (event) => {
           const cachedPage = await caches.match(event.request);
           return cachedPage || caches.match("/");
         }),
+    );
+    return;
+  }
+
+  // Icons & manifest: network-first so new artwork ships without waiting for cache expiry.
+  if (isShellAssetUrl(url)) {
+    event.respondWith(
+      fetch(event.request)
+        .then((response) => {
+          if (response.ok) {
+            const copy = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy));
+          }
+          return response;
+        })
+        .catch(() => caches.match(event.request)),
     );
     return;
   }

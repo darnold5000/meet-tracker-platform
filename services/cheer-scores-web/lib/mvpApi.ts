@@ -2,6 +2,7 @@ import type {
   MvpResultsResponse,
   MvpSearchResponse,
   MvpTimelineResponse,
+  MvpUpcomingMeetsResponse,
 } from "./mvpTypes";
 
 const getBaseUrl = () => {
@@ -16,14 +17,31 @@ const getBaseUrl = () => {
   return url.replace(/\/$/, "");
 };
 
-export async function mvpSearch(q: string): Promise<MvpSearchResponse> {
+export async function mvpSearch(
+  q: string,
+  opts?: { gym?: string }
+): Promise<MvpSearchResponse> {
   const base = getBaseUrl();
   const sp = new URLSearchParams();
   if (q.trim()) sp.set("q", q.trim());
+  const g = opts?.gym?.trim();
+  if (g) sp.set("gym", g);
   const res = await fetch(`${base}/api/mvp/search?${sp.toString()}`, { cache: "no-store" });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
     throw new Error((err as { detail?: string }).detail ?? "Search failed");
+  }
+  return res.json();
+}
+
+export async function mvpUpcomingMeets(limit = 3): Promise<MvpUpcomingMeetsResponse> {
+  const base = getBaseUrl();
+  const sp = new URLSearchParams();
+  sp.set("limit", String(limit));
+  const res = await fetch(`${base}/api/mvp/upcoming-meets?${sp.toString()}`, { cache: "no-store" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error((err as { detail?: string }).detail ?? "Failed to load upcoming meets");
   }
   return res.json();
 }

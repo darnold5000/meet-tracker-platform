@@ -36,7 +36,10 @@ class CheerMvpMeet(Base):
     location = Column(String(255))
     start_date = Column(Date)
     end_date = Column(Date)
+    starts_at = Column(DateTime(timezone=True))
+    ends_at = Column(DateTime(timezone=True))
     source = Column(String(64))
+    hub_results_snapshot_hash = Column(String(64), nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now)
 
@@ -80,6 +83,8 @@ class CheerMvpPerformance(Base):
     performance_score = Column(Float)
     rank = Column(Integer)
     deductions = Column(Float)
+    # Stable identity for one inbound Varsity result row (used for idempotent upsert).
+    source_row_hash = Column(String(64), nullable=True, unique=True)
     created_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now)
     updated_at = Column(DateTime(timezone=True), nullable=False, default=_utc_now, onupdate=_utc_now)
 

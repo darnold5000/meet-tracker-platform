@@ -22,6 +22,8 @@ Env:
   CHEER_VAR_EVENT_IDS       Optional comma-separated event ids to sync **regardless of date**
   CHEER_VAR_SYNC_UNDATED_MEETS  If true, also sync VARSITY meets with no start/end dates
   CHEER_USE_CODE_TARGET_LIST    If ``0``/``false``, skip ``CHEER_TARGET_VAR_EVENTS`` (DB only)
+  CHEER_HUB_MERGE_FACETS    Default on: merge hub results from default view + each Cheer/Dance
+                            category facet (matches tv.varsity.com filters). Set ``0`` to disable.
   DATABASE_URL              Required (Postgres)
 
 Optional one-off (from ``services/ingest-cheer``):

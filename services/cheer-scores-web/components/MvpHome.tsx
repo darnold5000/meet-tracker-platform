@@ -2,10 +2,17 @@
 
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
-import { mvpSearch } from "@/lib/mvpApi";
+import { mvpSearch, mvpUpcomingMeets } from "@/lib/mvpApi";
 import { formatMvpMeetWhen, humanizedMeetName, mvpMeetPickerLabel } from "@/lib/mvpMeetDisplay";
-import type { MvpMeetHit, MvpRecentItem, MvpSearchResponse, MvpTeamHit } from "@/lib/mvpTypes";
+import type {
+  MvpMeetHit,
+  MvpRecentItem,
+  MvpSearchResponse,
+  MvpTeamHit,
+  MvpUpcomingMeetsResponse,
+} from "@/lib/mvpTypes";
 import { pushMvpRecent, readMvpRecents } from "@/lib/mvpRecents";
+import { MvpInstallHintBanner } from "@/components/MvpPwaInstallProvider";
 
 export function MvpHome() {
   const [q, setQ] = useState("");
@@ -14,6 +21,7 @@ export function MvpHome() {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [recents, setRecents] = useState<MvpRecentItem[]>([]);
+  const [upcoming, setUpcoming] = useState<MvpUpcomingMeetsResponse | null>(null);
 
   useEffect(() => {
     setRecents(readMvpRecents());
@@ -42,6 +50,25 @@ export function MvpHome() {
     void runSearch(debounced);
   }, [debounced, runSearch]);
 
+  useEffect(() => {
+    if (debounced.trim()) {
+      setUpcoming(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const u = await mvpUpcomingMeets(3);
+        if (!cancelled) setUpcoming(u);
+      } catch {
+        if (!cancelled) setUpcoming(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [debounced]);
+
   const onOpenMeet = (m: MvpMeetHit) => {
     pushMvpRecent({ kind: "meet", meetKey: m.meet_key, label: mvpMeetPickerLabel(m) });
     setRecents(readMvpRecents());
@@ -61,9 +88,11 @@ export function MvpHome() {
         ← Competition view
       </Link>
       <header className="mb-6 rounded-2xl bg-gradient-to-br from-[var(--brand)] via-[#003d52] to-[var(--brand-bright)] px-4 py-4 text-white shadow-lg">
-        <h1 className="text-lg font-bold tracking-tight">Cheer scores</h1>
+        <h1 className="text-lg font-bold tracking-tight">Cheer Tracker</h1>
         <p className="mt-1 text-sm opacity-90">Search teams or competitions</p>
       </header>
+
+      <MvpInstallHintBanner tightTop />
 
       <label className="sr-only" htmlFor="mvp-search">
         Search
@@ -80,6 +109,35 @@ export function MvpHome() {
 
       {loading && <p className="mb-3 text-sm text-[var(--muted)]">Searching…</p>}
       {err && <p className="mb-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-800">{err}</p>}
+
+      {!debounced.trim() && upcoming && upcoming.meets.length > 0 && (
+        <section className="mb-6">
+          <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
+            Up next
+          </h2>
+          <p className="mb-2 text-[11px] leading-snug text-slate-500">
+            Next competitions on the calendar (rebroadcasts excluded).
+          </p>
+          <ul className="space-y-2">
+            {upcoming.meets.map((m) => (
+              <li key={m.meet_key}>
+                <Link
+                  href={`/meet/${encodeURIComponent(m.meet_key)}`}
+                  onClick={() => onOpenMeet(m)}
+                  className="block rounded-xl border border-sky-200/80 bg-sky-50/80 p-3 shadow-sm transition hover:border-[var(--brand)]"
+                >
+                  <div className="font-semibold text-[var(--text)]">
+                    {humanizedMeetName(m.name) || m.meet_key}
+                  </div>
+                  <div className="mt-0.5 text-xs text-[var(--muted)]">
+                    {[m.location, formatMvpMeetWhen(m)].filter(Boolean).join(" · ")}
+                  </div>
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {recents.length > 0 && (
         <section className="mb-6">

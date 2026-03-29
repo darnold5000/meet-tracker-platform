@@ -1,5 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import Script from "next/script";
+import { MvpFeedbackFab } from "@/components/MvpFeedbackFab";
+import { MvpPwaInstallProvider } from "@/components/MvpPwaInstallProvider";
 import "./globals.css";
 
 export const viewport: Viewport = {
@@ -7,17 +9,17 @@ export const viewport: Viewport = {
 };
 
 export const metadata: Metadata = {
-  title: "Cheer Scores",
-  description: "Live cheer competition scores",
-  manifest: "/manifest.webmanifest",
+  title: "Cheer Tracker",
+  description: "Track live all-star cheer competition scores",
+  manifest: "/manifest.webmanifest?v=5",
   icons: {
-    icon: "/icon-512.png",
-    apple: "/apple-touch-icon.png",
+    icon: "/icon-512.png?v=5",
+    apple: "/apple-touch-icon.png?v=5",
   },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",
-    title: "Cheer Scores",
+    title: "Cheer Tracker",
   },
 };
 
@@ -29,7 +31,8 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className="min-h-screen antialiased">
-        {children}
+        <MvpPwaInstallProvider>{children}</MvpPwaInstallProvider>
+        <MvpFeedbackFab />
         <Script src="https://tally.so/widgets/embed.js" strategy="lazyOnload" />
       </body>
     </html>

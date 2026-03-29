@@ -1,37 +1,39 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MVP_DEFAULT_MEET_KEY, MVP_DEFAULT_MEET_LABEL } from "@/lib/mvpDefaults";
 import {
   dedupeMvpResultRows,
   dedupeMvpTimelineItems,
   filterMvpResultsByRoundTab,
-  mvpResultIsFinalsRound,
+  mvpResultRowMetaExtras,
+  mvpResultsRoundAvailability,
+  mvpSuggestResultsRoundTab,
   type MvpResultsRoundTab,
 } from "@/lib/mvpDedupe";
-import { mvpResults, mvpTimeline } from "@/lib/mvpApi";
+import { mvpResults, mvpSearch, mvpTimeline } from "@/lib/mvpApi";
 import {
   formatMvpMeetDateRangeReadable,
+  formatMvpMeetStartsAtReadable,
   getMvpMeetScheduleStatus,
+  mvpCoalesceMeetLocation,
   mvpMeetHeaderNameLine,
   mvpMeetPickerLabel,
   mvpMeetShowsTimelineTab,
   mvpMeetSummaryToHit,
+  mvpResultRowScheduleCaption,
+  mvpTimelineWhenDisplay,
 } from "@/lib/mvpMeetDisplay";
-import type { MvpResultRow, MvpTimelineItem, MvpTimelineResponse } from "@/lib/mvpTypes";
+import type { MvpMeetHit, MvpResultRow, MvpTimelineItem, MvpTimelineResponse } from "@/lib/mvpTypes";
 import { pushMvpRecent } from "@/lib/mvpRecents";
 import { MvpResultScoreBreakdown } from "@/components/MvpResultScoreBreakdown";
-
-function formatTime(iso: string | null | undefined): string {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  } catch {
-    return iso;
-  }
-}
+import { MvpInstallHintBanner } from "@/components/MvpPwaInstallProvider";
+import { MvpMeetResultsScheduleTabs } from "@/components/MvpMeetResultsScheduleTabs";
+import { MvpResultsRoundPills } from "@/components/MvpResultsRoundPills";
+import { varsityOfficialScheduleUrlForMeetKey } from "@/lib/mvpVarsityLinks";
+import { openTallyFeedback, TALLY_FEEDBACK_FORM_ID } from "@/lib/feedback";
+import { useMvpLiveAutoRefresh } from "@/lib/useMvpLiveAutoRefresh";
 
 function statusTone(
   status: string,
@@ -52,8 +54,13 @@ function medalForRank(rank: number | null): string {
   return "";
 }
 
+function mvpFeedbackHelpfulDismissStorageKey(key: string) {
+  return `cheer-mvp-feedback-helpful-dismissed-${key}`;
+}
+
 export function MvpMeetPage({ meetKey }: { meetKey: string }) {
-  const [tab, setTab] = useState<"timeline" | "results">("timeline");
+  const resultsRoundTabInitializedRef = useRef(false);
+  const [tab, setTab] = useState<"timeline" | "results">("results");
   const [sessionId, setSessionId] = useState<number | "">("");
   const [timeline, setTimeline] = useState<MvpTimelineResponse | null>(null);
   const [results, setResults] = useState<MvpResultRow[]>([]);
@@ -62,8 +69,32 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
   const [errT, setErrT] = useState<string | null>(null);
   const [errR, setErrR] = useState<string | null>(null);
   const [resultsRoundTab, setResultsRoundTab] = useState<MvpResultsRoundTab>("finals");
+  const [searchMeetHit, setSearchMeetHit] = useState<MvpMeetHit | null>(null);
+  const [contextualFeedbackDismissed, setContextualFeedbackDismissed] = useState(false);
+  const [autoRefreshLiveScores, setAutoRefreshLiveScores] = useState(true);
 
   const sid = sessionId === "" ? null : sessionId;
+  const meetKeyRef = useRef(meetKey);
+  meetKeyRef.current = meetKey;
+  const sidRef = useRef(sid);
+  sidRef.current = sid;
+
+  useEffect(() => {
+    let cancelled = false;
+    setSearchMeetHit(null);
+    (async () => {
+      try {
+        const res = await mvpSearch("");
+        if (cancelled) return;
+        setSearchMeetHit(res.meets.find((m) => m.meet_key === meetKey) ?? null);
+      } catch {
+        if (!cancelled) setSearchMeetHit(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [meetKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -93,8 +124,29 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
   }, [meetKey, sid]);
 
   useEffect(() => {
+    resultsRoundTabInitializedRef.current = false;
     setResultsRoundTab("finals");
     setResults([]);
+    setTab("results");
+  }, [meetKey]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const k = mvpFeedbackHelpfulDismissStorageKey(meetKey);
+      setContextualFeedbackDismissed(window.localStorage.getItem(k) === "1");
+    } catch {
+      setContextualFeedbackDismissed(false);
+    }
+  }, [meetKey]);
+
+  const dismissContextualFeedbackHelpful = useCallback(() => {
+    try {
+      window.localStorage.setItem(mvpFeedbackHelpfulDismissStorageKey(meetKey), "1");
+    } catch {
+      /* ignore */
+    }
+    setContextualFeedbackDismissed(true);
   }, [meetKey]);
 
   useEffect(() => {
@@ -125,10 +177,27 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
     };
   }, [tab, meetKey, sid]);
 
+  const { hasFinals: hasFinalsRoundScores, hasPrelims: hasPrelimsRoundScores } = useMemo(
+    () => mvpResultsRoundAvailability(results),
+    [results]
+  );
+  const showResultsRoundPills = hasFinalsRoundScores && hasPrelimsRoundScores;
+
   useEffect(() => {
-    if (results.length === 0) return;
-    if (!results.some(mvpResultIsFinalsRound)) setResultsRoundTab("prelims");
-  }, [meetKey, results]);
+    if (results.length > 0 && !resultsRoundTabInitializedRef.current) {
+      setResultsRoundTab(mvpSuggestResultsRoundTab(results));
+      resultsRoundTabInitializedRef.current = true;
+    }
+  }, [results]);
+
+  useEffect(() => {
+    if (!hasFinalsRoundScores && hasPrelimsRoundScores && resultsRoundTab === "finals") {
+      setResultsRoundTab("prelims");
+    }
+    if (hasFinalsRoundScores && !hasPrelimsRoundScores && resultsRoundTab === "prelims") {
+      setResultsRoundTab("finals");
+    }
+  }, [hasFinalsRoundScores, hasPrelimsRoundScores, resultsRoundTab]);
 
   const sessions = timeline?.sessions ?? [];
   const filteredItems: MvpTimelineItem[] = useMemo(() => timeline?.items ?? [], [timeline]);
@@ -148,9 +217,38 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
     ? mvpMeetHeaderNameLine(timeline.meet, meetKey, MVP_DEFAULT_MEET_KEY, MVP_DEFAULT_MEET_LABEL)
     : "";
   const scheduleStatus = getMvpMeetScheduleStatus(timeline?.meet ?? null);
-  const headerLocationLine = timeline ? (timeline.meet.location ?? "").trim() || null : null;
-  const headerDateRangeLine = timeline ? formatMvpMeetDateRangeReadable(timeline.meet) : null;
+  const meetStartsReadable = formatMvpMeetStartsAtReadable(timeline?.meet ?? null);
+  const headerLocationLine = timeline
+    ? mvpCoalesceMeetLocation(meetKey, timeline.meet.location, searchMeetHit?.location)
+    : null;
+  const headerDateRangeLine = timeline
+    ? formatMvpMeetDateRangeReadable(timeline.meet) ||
+      formatMvpMeetDateRangeReadable(searchMeetHit)
+    : null;
   const showTimelineTab = mvpMeetShowsTimelineTab(timeline?.meet);
+  const varsityScheduleUrl = useMemo(
+    () => varsityOfficialScheduleUrlForMeetKey(meetKey),
+    [meetKey]
+  );
+  const canAutoRefreshLive = Boolean(timeline) && scheduleStatus.tone === "live";
+
+  useEffect(() => {
+    if (varsityScheduleUrl && tab === "timeline") setTab("results");
+  }, [varsityScheduleUrl, tab, meetKey]);
+
+  const refreshLiveMvpData = useCallback(async () => {
+    const k = meetKeyRef.current;
+    const s = sidRef.current;
+    const [tlRes, rRes] = await Promise.allSettled([
+      mvpTimeline(k, s),
+      mvpResults(k, s),
+    ]);
+    if (meetKeyRef.current !== k) return;
+    if (tlRes.status === "fulfilled") setTimeline(tlRes.value);
+    if (rRes.status === "fulfilled") setResults(rRes.value.results);
+  }, []);
+
+  useMvpLiveAutoRefresh(autoRefreshLiveScores, canAutoRefreshLive, refreshLiveMvpData);
 
   const loading = tab === "timeline" ? loadingT : loadingR;
   const err = tab === "timeline" ? errT : errR;
@@ -162,10 +260,23 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
       </Link>
 
       {timeline && headerNameLine && (
-        <header className="mb-4 rounded-2xl bg-gradient-to-br from-[var(--brand)] via-[#003d52] to-[var(--brand-bright)] px-4 py-4 text-white shadow-lg">
-          <div className="flex items-start justify-between gap-3">
+        <header className="relative mb-4 overflow-hidden rounded-2xl border border-lime-300/40 bg-gradient-to-r from-sky-500 via-cyan-300 to-teal-200 px-4 py-3 text-white shadow-lg shadow-black/10 ring-1 ring-white/10">
+          <div
+            aria-hidden
+            className="pointer-events-none absolute inset-0 bg-gradient-to-r from-black/24 via-black/10 to-black/28"
+          />
+          <div className="relative z-10 flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1">
-              <h1 className="text-lg font-bold uppercase leading-tight tracking-wide">{headerNameLine}</h1>
+              <h1 className="text-lg font-semibold uppercase leading-tight tracking-wide text-white drop-shadow-[0_1px_2px_rgba(0,0,0,0.55)]">
+                {headerNameLine}
+              </h1>
+              {(headerLocationLine || headerDateRangeLine) && (
+                <p className="mt-1.5 truncate text-xs font-medium text-white/90 drop-shadow-[0_1px_2px_rgba(0,0,0,0.45)]">
+                  {headerLocationLine}
+                  {headerLocationLine && headerDateRangeLine ? " · " : ""}
+                  {headerDateRangeLine}
+                </p>
+              )}
             </div>
             {scheduleStatus.tone !== "past" && (
               <span
@@ -179,18 +290,10 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
               </span>
             )}
           </div>
-          {(headerLocationLine || headerDateRangeLine) && (
-            <div className="mt-3 flex items-start justify-between gap-4 border-t border-white/20 pt-3 text-sm leading-snug">
-              <div className="min-w-0 flex-1 text-white/90">
-                {headerLocationLine ? <p>{headerLocationLine}</p> : null}
-              </div>
-              {headerDateRangeLine && (
-                <p className="max-w-[58%] shrink-0 text-right font-medium text-white">{headerDateRangeLine}</p>
-              )}
-            </div>
-          )}
         </header>
       )}
+
+      <MvpInstallHintBanner tightTop />
 
       {!timeline && loadingT && <p className="text-sm text-[var(--muted)]">Loading meet…</p>}
       {errT && !timeline && <p className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-800">{errT}</p>}
@@ -218,64 +321,42 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
         </div>
       )}
 
-      <div className="mb-4 overflow-hidden rounded-2xl border border-slate-200 bg-slate-100/90 shadow-sm ring-1 ring-slate-200/60">
-        {showTimelineTab ? (
-          <div className="flex gap-1 p-1">
-            <button
-              type="button"
-              onClick={() => setTab("timeline")}
-              className={`flex-1 rounded-full py-2 text-sm font-bold uppercase tracking-wide ${
-                tab === "timeline"
-                  ? "bg-[var(--accent)] text-[var(--accent-foreground)] shadow-sm"
-                  : "text-[var(--muted)]"
-              }`}
-            >
-              Timeline
-            </button>
-            <button
-              type="button"
-              onClick={() => setTab("results")}
-              className={`flex-1 rounded-full py-2 text-sm font-bold uppercase tracking-wide ${
-                tab === "results"
-                  ? "bg-[var(--accent)] text-[var(--accent-foreground)] shadow-sm"
-                  : "text-[var(--muted)]"
-              }`}
-            >
-              Results
-            </button>
-          </div>
-        ) : (
-          <div
-            className="bg-[var(--accent)] px-3 py-2 text-center text-sm font-bold uppercase tracking-wide text-[var(--accent-foreground)]"
-            role="status"
-          >
-            Results
-          </div>
-        )}
-        {tab === "results" && (
-          <div className="flex gap-1 border-t border-slate-200/80 bg-slate-50/95 p-1">
-            <button
-              type="button"
-              onClick={() => setResultsRoundTab("finals")}
-              className={`flex-1 rounded-full py-1.5 text-xs font-bold uppercase tracking-wide ${
-                resultsRoundTab === "finals"
-                  ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200"
-                  : "text-[var(--muted)]"
-              }`}
-            >
-              Finals
-            </button>
-            <button
-              type="button"
-              onClick={() => setResultsRoundTab("prelims")}
-              className={`flex-1 rounded-full py-1.5 text-xs font-bold uppercase tracking-wide ${
-                resultsRoundTab === "prelims"
-                  ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-200"
-                  : "text-[var(--muted)]"
-              }`}
-            >
-              Prelims
-            </button>
+      {canAutoRefreshLive && (
+        <label className="mb-4 flex items-center gap-1.5 text-xs text-slate-700">
+          <input
+            type="checkbox"
+            checked={autoRefreshLiveScores}
+            onChange={(e) => setAutoRefreshLiveScores(e.target.checked)}
+            className="rounded"
+          />
+          Auto-refresh live scores
+        </label>
+      )}
+
+      <div className="mb-4 overflow-hidden rounded-xl border border-slate-200 bg-slate-100/90 shadow-sm ring-1 ring-slate-200/60">
+        <MvpMeetResultsScheduleTabs
+          meetKey={meetKey}
+          tab={tab}
+          onTabChange={setTab}
+          showInAppTimelineTab={showTimelineTab}
+        />
+        {!showTimelineTab && tab === "results" && !varsityScheduleUrl && (
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 bg-slate-50/95 px-3 py-2">
+            <h2 className="text-[11px] font-semibold uppercase tracking-wide text-slate-600">Results</h2>
+            <div className="flex flex-wrap items-center gap-2">
+              {showResultsRoundPills ? (
+                <MvpResultsRoundPills
+                  value={resultsRoundTab}
+                  onChange={(v) => {
+                    resultsRoundTabInitializedRef.current = true;
+                    setResultsRoundTab(v);
+                  }}
+                />
+              ) : null}
+              {!loadingR && (
+                <p className="text-xs text-[var(--muted)]">{displayResultRows.length} teams</p>
+              )}
+            </div>
           </div>
         )}
       </div>
@@ -283,32 +364,80 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
       {loading && <p className="text-sm text-[var(--muted)]">Loading…</p>}
       {err && timeline && <p className="mb-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-800">{err}</p>}
 
+      {!loadingT && tab === "timeline" && timeline && (
+        <p className="mt-1 text-xs text-[var(--muted)]">
+          {displayTimelineItems.filter((i) => !i.is_break).length} routines
+        </p>
+      )}
+
+      {!loading &&
+        tab === "timeline" &&
+        timeline &&
+        displayTimelineItems.filter((i) => !i.is_break).length === 0 && (
+          <div className="mt-2 rounded-xl border border-sky-200 bg-sky-50/90 px-3 py-2.5 text-sm text-slate-800 shadow-sm">
+            {scheduleStatus.tone === "upcoming" ? (
+              <>
+                <p className="font-semibold text-slate-900">This competition hasn’t started yet</p>
+                {meetStartsReadable && (
+                  <p className="mt-1 text-xs leading-snug text-slate-600">Scheduled: {meetStartsReadable}</p>
+                )}
+                <p className="mt-1.5 text-xs leading-snug text-slate-600">
+                  {varsityScheduleUrl ? (
+                    <>
+                      Use <span className="font-medium">Schedule</span> above for Varsity’s official schedule on the
+                      next screen.
+                    </>
+                  ) : (
+                    <>
+                      Open <span className="font-medium">Schedule</span> to see mat order when that data is available.
+                    </>
+                  )}
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="font-semibold text-slate-900">No routine list in the feed yet</p>
+                <p className="mt-1 text-xs leading-snug text-slate-600">
+                  We’re not seeing scored divisions or a published mat order for this meet in the Varsity results
+                  API. Check back after performances begin.
+                </p>
+              </>
+            )}
+          </div>
+        )}
+
       {!loading && tab === "timeline" && timeline && (
         <ol className="space-y-2">
           {displayTimelineItems.map((row) => {
+            const when = mvpTimelineWhenDisplay(row);
             if (row.is_break) {
               return (
                 <li
                   key={row.performance_id}
                   className="flex items-center gap-3 rounded-xl border border-dashed border-slate-300 bg-slate-50 px-3 py-3 text-sm text-[var(--muted)]"
                 >
-                  <span className="w-14 shrink-0 font-mono text-xs">{formatTime(row.scheduled_time)}</span>
+                  <span className="w-14 shrink-0 font-mono text-xs" title={when.title}>
+                    {when.text}
+                  </span>
                   <span>{row.break_label || "Break"}</span>
                 </li>
               );
             }
             const st = statusTone(row.status, row.final_score);
             const sessionLine = row.session_name?.trim() || "";
-            const extraMeta = [row.team_level, row.team_division, row.round].filter(Boolean).filter(
-              (bit) => !sessionLine.toLowerCase().includes(String(bit).toLowerCase())
-            );
+            const extraLevelDiv = mvpResultRowMetaExtras(sessionLine, row.team_level, row.team_division);
+            const roundBit = row.round?.trim();
+            const extraMeta = [
+              ...extraLevelDiv,
+              ...(roundBit && !sessionLine.toLowerCase().includes(roundBit.toLowerCase()) ? [roundBit] : []),
+            ];
             return (
               <li
                 key={row.performance_id}
                 className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white px-3 py-3 shadow-sm"
               >
-                <div className="w-14 shrink-0 font-mono text-xs text-[var(--muted)]">
-                  {formatTime(row.scheduled_time)}
+                <div className="w-14 shrink-0 font-mono text-xs text-[var(--muted)]" title={when.title}>
+                  {when.text}
                 </div>
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-2">
@@ -333,38 +462,134 @@ export function MvpMeetPage({ meetKey }: { meetKey: string }) {
         </ol>
       )}
 
-      {!loading && tab === "results" && (
-        <ol className="space-y-2">
-          {displayResultRows.length === 0 ? (
-            <p className="text-sm text-[var(--muted)]">No scored routines for this filter yet.</p>
-          ) : (
-            displayResultRows.map((r, idx) => {
-              const sessionLine = r.session_name?.trim() || "";
-              const extras = [r.team_level, r.team_division].filter(Boolean).filter(
-                (bit) => !sessionLine.toLowerCase().includes(String(bit).toLowerCase())
-              );
-              const line = [sessionLine, ...extras].filter(Boolean).join(" · ");
-              return (
-                <li
-                  key={`${r.team_name}-${r.session_id}-${idx}`}
-                  className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3 py-3 shadow-sm"
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="font-semibold text-[var(--text)]">
-                      {medalForRank(r.rank)}
-                      {r.team_name}
-                    </div>
-                    {r.team_gym_name && (
-                      <div className="text-xs font-medium text-[var(--gym)]">{r.team_gym_name}</div>
-                    )}
-                    {line && <div className="text-xs text-[var(--muted)]">{line}</div>}
-                  </div>
-                  <MvpResultScoreBreakdown r={r} showRankOrdinal={false} />
-                </li>
-              );
-            })
+      {tab === "results" && (
+        <>
+          {(showTimelineTab || varsityScheduleUrl) && (
+            <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+              {showResultsRoundPills ? (
+                <MvpResultsRoundPills
+                  value={resultsRoundTab}
+                  onChange={(v) => {
+                    resultsRoundTabInitializedRef.current = true;
+                    setResultsRoundTab(v);
+                  }}
+                />
+              ) : null}
+              {!loadingR && (
+                <p className="text-xs text-[var(--muted)]">{displayResultRows.length} teams</p>
+              )}
+            </div>
           )}
-        </ol>
+          {!loading && (
+            <>
+              {TALLY_FEEDBACK_FORM_ID &&
+                !contextualFeedbackDismissed &&
+                !err &&
+                displayResultRows.length > 0 && (
+                  <div className="relative mt-2 rounded-lg border border-slate-200 bg-slate-50 py-2 pl-2.5 pr-9 text-[11px] leading-snug text-slate-600">
+                    <button
+                      type="button"
+                      onClick={() => dismissContextualFeedbackHelpful()}
+                      className="absolute right-1 top-1 flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-200/80 hover:text-slate-800"
+                      aria-label="Dismiss"
+                    >
+                      <span className="text-lg leading-none" aria-hidden="true">
+                        ×
+                      </span>
+                    </button>
+                    <p>
+                      💬 Was this helpful? Tap{" "}
+                      <button
+                        type="button"
+                        onClick={() => openTallyFeedback()}
+                        className="font-semibold text-red-700 underline decoration-red-300 underline-offset-2 hover:text-red-800"
+                      >
+                        Feedback
+                      </button>{" "}
+                      (bottom right) — takes under a minute.
+                    </p>
+                  </div>
+                )}
+              <ol className="mt-2 space-y-2">
+              {displayResultRows.length === 0 ? (
+                results.length === 0 ? (
+                  <div className="rounded-xl border border-sky-200 bg-sky-50/90 px-3 py-2.5 text-sm text-slate-800 shadow-sm">
+                    <p className="font-semibold text-slate-900">No scores in the feed yet</p>
+                    <p className="mt-1 text-xs leading-snug text-slate-600">
+                      Scores show up after Varsity publishes them for this meet.{" "}
+                      {showResultsRoundPills
+                        ? "If the event is live, try the Prelims pill—Finals may stay empty until those rounds are posted."
+                        : "If the event is live, check back as more rounds post."}
+                    </p>
+                    <p className="mt-1.5 text-xs leading-snug text-slate-600">
+                      {varsityScheduleUrl ? (
+                        <>
+                          Use <span className="font-medium">Schedule</span> above for Varsity’s official schedule on the
+                          next screen.
+                        </>
+                      ) : (
+                        <>
+                          Open <span className="font-medium">Schedule</span> to see mat order when that data is
+                          available.
+                        </>
+                      )}
+                    </p>
+                    {TALLY_FEEDBACK_FORM_ID ? (
+                      <p className="mt-3 text-xs text-slate-600">
+                        💬 Expecting scores here or something look wrong? Tap{" "}
+                        <button
+                          type="button"
+                          onClick={() => openTallyFeedback()}
+                          className="font-semibold text-sky-900 underline decoration-sky-400/60 underline-offset-2 hover:text-sky-950"
+                        >
+                          Feedback
+                        </button>
+                        .
+                      </p>
+                    ) : null}
+                  </div>
+                ) : (
+                  <p className="text-sm text-[var(--muted)]">
+                    {showResultsRoundPills
+                      ? "Nothing in this round yet. Try the other Finals / Prelims pill."
+                      : "Nothing in this round for the current session."}
+                  </p>
+                )
+              ) : (
+                displayResultRows.map((r, idx) => {
+                  const sessionLine = r.session_name?.trim() || "";
+                  const extras = mvpResultRowMetaExtras(sessionLine, r.team_level, r.team_division);
+                  const line = [sessionLine, ...extras].filter(Boolean).join(" · ");
+                  return (
+                    <li
+                      key={`${r.team_name}-${r.session_id}-${idx}`}
+                      className="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3 py-3 shadow-sm"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="font-semibold text-[var(--text)]">
+                          {medalForRank(r.rank)}
+                          {r.team_name}
+                        </div>
+                        {r.team_gym_name && (
+                          <div className="text-xs font-medium text-[var(--gym)]">{r.team_gym_name}</div>
+                        )}
+                        {line && <div className="text-xs text-[var(--muted)]">{line}</div>}
+                        {(() => {
+                          const cap = mvpResultRowScheduleCaption(r);
+                          return cap ? (
+                            <div className="mt-1 text-[10px] font-medium tabular-nums text-slate-600">{cap}</div>
+                          ) : null;
+                        })()}
+                      </div>
+                      <MvpResultScoreBreakdown r={r} showRankOrdinal={false} />
+                    </li>
+                  );
+                })
+              )}
+            </ol>
+            </>
+          )}
+        </>
       )}
     </div>
   );

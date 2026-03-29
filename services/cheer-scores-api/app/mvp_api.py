@@ -12,6 +12,43 @@ from cheer_scores.db import fetch_all, fetch_one
 
 router = APIRouter(prefix="/api/mvp", tags=["mvp"])
 
+# Team routine with at least one numeric score posted (excludes schedule-only / placeholder rows).
+_MVP_SCORED_PERF_ON = """
+  p.meet_id = m.id
+  AND p.is_break = false
+  AND p.team_id IS NOT NULL
+  AND (
+    p.final_score IS NOT NULL
+    OR p.raw_score IS NOT NULL
+    OR p.performance_score IS NOT NULL
+  )
+"""
+
+_MVP_SCORED_PERF_ON_TEAM = """
+  p.team_id = t.id
+  AND p.is_break = false
+  AND p.team_id IS NOT NULL
+  AND (
+    p.final_score IS NOT NULL
+    OR p.raw_score IS NOT NULL
+    OR p.performance_score IS NOT NULL
+  )
+"""
+
+_MVP_MEET_HAS_SCORES_SQL = """
+EXISTS (
+  SELECT 1 FROM cheer_mvp_performances p
+  WHERE p.meet_id = m.id
+    AND p.is_break = false
+    AND p.team_id IS NOT NULL
+    AND (
+      p.final_score IS NOT NULL
+      OR p.raw_score IS NOT NULL
+      OR p.performance_score IS NOT NULL
+    )
+)
+"""
+
 
 def _json_val(v: Any) -> Any:
     if isinstance(v, (datetime, date)):
@@ -24,9 +61,19 @@ def _row(r: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/search")
-def mvp_search(q: str = Query("", min_length=0, max_length=200)):
+def mvp_search(
+    q: str = Query("", min_length=0, max_length=200),
+    gym: str = Query(
+        "",
+        max_length=255,
+        description="If set, only meets that have at least one scored routine for this gym name (case-insensitive exact match on trimmed gym_name).",
+    ),
+):
     try:
         needle = f"%{q.strip().lower()}%"
+        gym_trim = gym.strip()
+        gym_names: list[str] = []
+
         if not q.strip():
             teams = fetch_all(
                 """
@@ -36,14 +83,44 @@ def mvp_search(q: str = Query("", min_length=0, max_length=200)):
                 LIMIT 15
                 """
             )
-            meets = fetch_all(
-                """
-                SELECT meet_key, name, location, start_date, end_date
-                FROM cheer_mvp_meets
-                ORDER BY start_date DESC NULLS LAST, name
-                LIMIT 120
+            gn_rows = fetch_all(
+                f"""
+                SELECT DISTINCT TRIM(t.gym_name) AS gym_name
+                FROM cheer_mvp_teams t
+                INNER JOIN cheer_mvp_performances p
+                  ON {_MVP_SCORED_PERF_ON_TEAM.strip()}
+                WHERE t.gym_name IS NOT NULL AND LENGTH(TRIM(t.gym_name)) > 0
+                ORDER BY gym_name
+                LIMIT 400
                 """
             )
+            gym_names = [str(r["gym_name"]) for r in gn_rows if r.get("gym_name")]
+
+            if gym_trim:
+                meets = fetch_all(
+                    f"""
+                    SELECT DISTINCT m.meet_key, m.name, m.location, m.start_date, m.end_date,
+                           m.starts_at, m.ends_at
+                    FROM cheer_mvp_meets m
+                    INNER JOIN cheer_mvp_performances p
+                      ON {_MVP_SCORED_PERF_ON.strip()}
+                    INNER JOIN cheer_mvp_teams t ON t.id = p.team_id
+                    WHERE LOWER(TRIM(COALESCE(t.gym_name, ''))) = LOWER(TRIM(:gym))
+                    ORDER BY m.start_date DESC NULLS LAST, m.name
+                    LIMIT 120
+                    """,
+                    {"gym": gym_trim},
+                )
+            else:
+                meets = fetch_all(
+                    f"""
+                    SELECT m.meet_key, m.name, m.location, m.start_date, m.end_date, m.starts_at, m.ends_at
+                    FROM cheer_mvp_meets m
+                    WHERE {_MVP_MEET_HAS_SCORES_SQL.strip()}
+                    ORDER BY m.start_date DESC NULLS LAST, m.name
+                    LIMIT 120
+                    """
+                )
         else:
             teams = fetch_all(
                 """
@@ -59,27 +136,88 @@ def mvp_search(q: str = Query("", min_length=0, max_length=200)):
                 """,
                 {"q": needle},
             )
-            meets = fetch_all(
-                """
-                SELECT meet_key, name, location, start_date, end_date
-                FROM cheer_mvp_meets
-                WHERE
-                  LOWER(name) LIKE :q
-                  OR LOWER(meet_key) LIKE :q
-                  OR LOWER(COALESCE(location, '')) LIKE :q
-                ORDER BY start_date DESC NULLS LAST, name
-                LIMIT 25
-                """,
-                {"q": needle},
-            )
+            if gym_trim:
+                meets = fetch_all(
+                    f"""
+                    SELECT DISTINCT m.meet_key, m.name, m.location, m.start_date, m.end_date,
+                           m.starts_at, m.ends_at
+                    FROM cheer_mvp_meets m
+                    INNER JOIN cheer_mvp_performances p
+                      ON {_MVP_SCORED_PERF_ON.strip()}
+                    INNER JOIN cheer_mvp_teams t ON t.id = p.team_id
+                    WHERE LOWER(TRIM(COALESCE(t.gym_name, ''))) = LOWER(TRIM(:gym))
+                      AND (
+                        LOWER(m.name) LIKE :q
+                        OR LOWER(m.meet_key) LIKE :q
+                        OR LOWER(COALESCE(m.location, '')) LIKE :q
+                      )
+                    ORDER BY m.start_date DESC NULLS LAST, m.name
+                    LIMIT 25
+                    """,
+                    {"q": needle, "gym": gym_trim},
+                )
+            else:
+                meets = fetch_all(
+                    f"""
+                    SELECT m.meet_key, m.name, m.location, m.start_date, m.end_date, m.starts_at, m.ends_at
+                    FROM cheer_mvp_meets m
+                    WHERE
+                      {_MVP_MEET_HAS_SCORES_SQL.strip()}
+                      AND (
+                        LOWER(m.name) LIKE :q
+                        OR LOWER(m.meet_key) LIKE :q
+                        OR LOWER(COALESCE(m.location, '')) LIKE :q
+                      )
+                    ORDER BY m.start_date DESC NULLS LAST, m.name
+                    LIMIT 25
+                    """,
+                    {"q": needle},
+                )
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    return {
+    out: dict[str, Any] = {
         "q": q.strip(),
         "teams": [_row(t) for t in teams],
         "meets": [_row(m) for m in meets],
     }
+    if not q.strip():
+        out["gym_names"] = gym_names
+    return out
+
+
+@router.get("/upcoming-meets")
+def mvp_upcoming_meets(limit: int = Query(3, ge=1, le=25)):
+    """
+    Next competitions from ``cheer_mvp_meets`` that still look upcoming, excluding
+    rebroadcasts (case-insensitive ``REBROADCAST`` in name). Uses DB rows filled by ingest
+    (Varsity event-ticker + results index), not a live Varsity call from this service.
+    """
+    try:
+        meets = fetch_all(
+            """
+            SELECT meet_key, name, location, start_date, end_date, starts_at, ends_at
+            FROM cheer_mvp_meets
+            WHERE
+              LOWER(COALESCE(name, '')) NOT LIKE '%rebroadcast%'
+              AND (ends_at IS NULL OR ends_at >= NOW())
+              AND (
+                (starts_at IS NOT NULL AND starts_at >= NOW())
+                OR (
+                  starts_at IS NULL
+                  AND start_date IS NOT NULL
+                  AND start_date >= CURRENT_DATE
+                )
+              )
+            ORDER BY starts_at ASC NULLS LAST, start_date ASC NULLS LAST, name ASC
+            LIMIT :lim
+            """,
+            {"lim": limit},
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    return {"limit": limit, "meets": [_row(m) for m in meets]}
 
 
 @router.get("/meet/{meet_key}/timeline")
@@ -90,7 +228,7 @@ def mvp_meet_timeline(
     try:
         meet = fetch_one(
             """
-            SELECT id, meet_key, name, location, start_date, end_date, source
+            SELECT id, meet_key, name, location, start_date, end_date, source, starts_at, ends_at
             FROM cheer_mvp_meets
             WHERE meet_key = :meet_key
             """,
@@ -170,7 +308,7 @@ def mvp_meet_results(
     try:
         meet = fetch_one(
             """
-            SELECT id, meet_key, name, location, start_date, end_date, source
+            SELECT id, meet_key, name, location, start_date, end_date, source, starts_at, ends_at
             FROM cheer_mvp_meets
             WHERE meet_key = :meet_key
             """,
@@ -197,6 +335,8 @@ def mvp_meet_results(
               p.raw_score,
               p.performance_score,
               p.deductions,
+              p.scheduled_time,
+              p.actual_time,
               t.name AS team_name,
               t.gym_name AS team_gym_name,
               t.level AS team_level,
